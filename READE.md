@@ -1,480 +1,216 @@
-# 📘 The Verified RAG Security Analyzer — How Our Code Actually Works
-### The real `.py` files of this project, and the exact journey one 100-line file takes through them — from the button you click to the verified finding that appears on screen.
+# 📘 Why Each Piece Exists — The RAG Security Analyzer, Explained by Problem
+### A presentation-ready walkthrough of this project: every stage told as **Problem → What we built → What breaks without it**, following one 100-line file (`bank.py`) and two rules through the real code.
 
-**How to read this:**
-- **Section A** = the map (every project file and its one job)
-- **Section B** = the entry point (`app.py` — where execution starts)
-- **Sections C–F** = the *journey*: we follow `bank.py` (100 lines, 2 planted bugs) hop-by-hop through the real functions, quoting the actual source of our project at each stop, showing what goes in and what comes out
-- **Section G** = the data-shape cheat sheet + full call graph
+**How to read / present this:**
+- **Part 0** — the story of the whole project in one page
+- **Part 1** — Phase A (indexing): why each ingestion stage exists
+- **Part 2** — Phase B (analysis): why each analysis stage exists
+- **Part 3** — the cross-cutting "whys" (config, schemas, wiring, honesty)
+- **Part 4** — the one-table summary + speaker's recap
 
-Everything quoted below is the **real code of this repository** (line numbers exact).
-
----
-
-# SECTION A — The map: every file, one job each
-
-```
-                          ┌────────────────────────────────────────────────┐
-                          │  app.py  (Streamlit UI — the ONLY entry point) │
-                          └───────────────┬────────────────┬───────────────┘
-                        [Index ▼]                       [Analyze ▼]
-     PHASE A — index ONCE, $0, no LLM      │      PHASE B — one loop per rule
-┌─────────────────────────────────────┐    │   ┌──────────────────────────────────────┐
-│ ingestion/indexer.py   (orchestrator)│    │   │ analysis/analyzer.py  (orchestrator)│
-│  ├─ file_discovery.py   find files   │    │   │  ├─ retrieval/retriever.py  top-K   │
-│  ├─ language_detector.py ext→lang    │    │   │  │   └─ embeddings/ + vector_store/  │
-│  ├─ tree_sitter_parser.py bytes→AST  │    │   │  ├─ llm/prompts.py    build prompt  │
-│  ├─ semantic_chunker.py   AST→units  │    │   │  ├─ llm/openrouter_client.py  call  │
-│  ├─ embeddings/embedder.py text→vec  │    │   │  ├─ analysis/evidence_validator.py │
-│  └─ vector_store/chroma_store.py     │    │   │  └─ analysis/deduplicator.py       │
-│              units+vectors → .chroma/ │    │   │              verdicts → report     │
-└─────────────────────────────────────┘    │   └──────────────────────────────────────┘
-        shared: config.py · models/schemas.py · security rules (rules.json)
-```
-
-| File | One job | Key function(s) |
-|---|---|---|
-| `app.py` | UI + **the only** place that wires everything together | `prepare_repo()`, `load_rules()`, Index & Analyze button blocks |
-| `config.py` | Read every knob from environment (`.env`), hard-code nothing | `Config.from_env()` |
-| `models/schemas.py` | The **data shapes** every module agrees on: `CodeUnit`, `SecurityRule`, `RetrievedUnit`, `EvidenceItem`, `RuleResult`, `AnalysisMetrics` | `CodeUnit.embedding_text()`, `SecurityRule.render()` |
-| `ingestion/file_discovery.py` | Walk the folder, return supported source files | `discover_source_files()`, `discover_unsupported_files()` |
-| `ingestion/language_detector.py` | Extension → language key | `detect_language()` |
-| `ingestion/tree_sitter_parser.py` | Language key + bytes → syntax tree; registry of 8 grammars | `TreeSitterParser.parse()`, `LANGUAGE_SPECS` |
-| `ingestion/semantic_chunker.py` | Syntax tree → list of `CodeUnit` (real functions/classes) | `chunk_file()` → `chunk_source()` → `_add_unit()` |
-| `ingestion/indexer.py` | **Orchestrates Phase A**; caching via manifest | `Indexer.index_repository()` |
-| `embeddings/embedder.py` | Text → 384-float vector (local model, offline fallback) | `embed_texts()`, `create_embedder()` |
-| `vector_store/chroma_store.py` | Persist vectors + code; cosine top-K query | `add()`, `query()` |
-| `retrieval/retriever.py` | Rule text → embedding → top-K `RetrievedUnit`s | `Retriever.retrieve()` |
-| `llm/prompts.py` | Build the strict system+user prompt; parse JSON back | `SYSTEM_PROMPT`, `build_user_prompt()`, `parse_llm_json()` |
-| `llm/openrouter_client.py` | HTTP call to the LLM, temperature 0.0 | `OpenRouterClient.chat()` |
-| `analysis/evidence_validator.py` | Fact-check every LLM citation **against disk** | `EvidenceValidator.validate()` |
-| `analysis/deduplicator.py` | Collapse duplicate `(rule, file, function, line)` findings | `deduplicate_findings()` |
-| `analysis/analyzer.py` | **Orchestrates Phase B** (the per-rule loop) | `SecurityAnalyzer.analyze()` → `_analyze_rule()` |
-
-**The two orchestrators are the spine:** `Indexer.index_repository()` (Phase A) and `SecurityAnalyzer.analyze()` (Phase B). Everything else is a single-purpose helper they call — if you remember only those two names, you can navigate the codebase.
+Every stage below maps to real files in this repository; file names and line numbers are exact.
 
 ---
 
-# SECTION B — Entry point: where execution starts (`app.py`)
+# PART 0 — The story in one page
 
-The whole project has exactly **one front door**: `streamlit run app.py`. Two buttons drive it.
+**The problem:** Teams want an LLM to check their code against security rules. Ask a raw chatbot "does this repo have SQL injection?" and it *answers confidently* — quoting files that don't exist, line numbers it never saw, functions it invented. The answer sounds right and is **unverifiable**. That's hallucination, and in security review, a fabricated finding (or a missed real one) is worse than no answer.
 
-**B.1 — Startup (runs on every page load):**
+**What we built:** a pipeline that never lets the LLM see the whole repo, never lets its claims reach the user unchecked, and never guesses when it can measure:
 
-```python
-# app.py:29
-config = Config.from_env()
-```
-`Config.from_env()` (`config.py:38-56`) reads `OPENROUTER_API_KEY`, `EMBEDDING_MODEL="all-MiniLM-L6-v2"`, `TOP_K=8`, `CHROMA_DIR=".chroma"`, `LLM_TEMPERATURE="0.0"`… from the environment/`.env`. **Why:** no secret, model or threshold is hard-coded anywhere else — one object carries every knob through the whole app.
+1. **Index once, locally** — turn the repository into semantic code units and vectors (Phase A). Free, no LLM.
+2. **Retrieve narrowly** — for each security rule, fetch only the top-8 *relevant* code units (not the whole repo).
+3. **Reason under strict rules** — one LLM call per rule, temperature 0.0, forced to cite file/line/code or say nothing.
+4. **Verify against disk** — every citation is fact-checked against the real files; unverifiable verdicts are **downgraded**, not displayed.
 
-**B.2 — The [Index ▼] button (app.py:141-157):**
+**The trust guarantee this buys:** the tool can still be *wrong about interpretation*, but it can no longer **invent evidence** — a VULNERABLE verdict physically cannot leave the analyzer without at least one citation that exists on disk. That single invariant is the project's reason for existing.
 
-```python
-if index_clicked:
-    repo_dir = prepare_repo()                        # uploads/ZIP/paste → a real folder on disk
-    embedder = create_embedder(config)               # embedder.py:89 → MiniLM (hashing fallback)
-    store = ChromaStore(persist_dir=chroma_dir, ...) # chroma_store.py:17 → .chroma/ folder
-    indexer = Indexer(embedder, store, max_file_bytes=config.max_file_bytes)
-    with st.spinner("Indexing ..."):
-        stats = indexer.index_repository(repo_dir)   # ★ Phase A begins HERE
-    st.session_state.repo_dir = str(repo_dir)
-    st.session_state.index_stats = stats.to_dict()
-```
+**The cast (one line each):**
 
-These lines build the three collaborators (embedder, store, indexer) purely from config, then hand the **folder path** to `index_repository()`. From this moment the 100 lines of `bank.py` start moving.
-
-**B.3 — The [Analyze ▼] button (app.py:190-219):**
-
-```python
-if analyze:
-    rules = load_rules()          # rules.json → list[SecurityRule]
-    repo_dir = prepare_repo()
-    embedder = create_embedder(config)
-    store    = ChromaStore(...)
-    retriever = Retriever(embedder, store)            # retriever.py:15
-    llm = OpenRouterClient(api_key=..., model=..., temperature=config.llm_temperature)  # 0.0
-    analyzer = SecurityAnalyzer(retriever, llm, EvidenceValidator(repo_dir), top_k=int(top_k))
-    report = analyzer.analyze(rules)                  # ★ Phase B begins HERE
-    st.session_state.report = report.to_dict()
-```
-
-**Why constructor injection:** `SecurityAnalyzer` never imports a concrete LLM or store — it *receives* them. That's how tests pass a fake LLM in one line, and how swapping the LLM provider touches only `app.py`.
-
-> **Mental model:** `app.py` = the order pad. `Indexer` = prep cook (Phase A, once). `SecurityAnalyzer` = line cook (Phase B, per rule). The shared ingredient between them is the `.chroma/` index Phase A wrote to disk.
+| File | Why it exists in one sentence |
+|---|---|
+| `app.py` | The only entry point — turns buttons into the two orchestrator calls |
+| `config.py` | So no secret/model/threshold is ever hard-coded |
+| `models/schemas.py` | So every module speaks the same data shapes |
+| `ingestion/indexer.py` | Phase A conductor: text → vectors, once |
+| `ingestion/file_discovery.py` | So we find source files *and honestly report* the ones we skip |
+| `ingestion/language_detector.py` | So one extension maps to one language, nothing more |
+| `ingestion/tree_sitter_parser.py` | So "what is a function" is answered by a grammar, not a regex |
+| `ingestion/semantic_chunker.py` | So chunks are real constructs (functions/classes), not line slices |
+| `embeddings/embedder.py` | So code and rules live in one comparable vector space |
+| `vector_store/chroma_store.py` | So the index survives restarts and answers top-K questions |
+| `retrieval/retriever.py` | So relevance is *candidate generation*, never a verdict |
+| `llm/prompts.py` | So the model is commanded to cite or stay silent |
+| `llm/openrouter_client.py` | So the one paid, external call is small, logged, deterministic |
+| `analysis/evidence_validator.py` | So every claim is checked against the actual repository |
+| `analysis/deduplicator.py` | So one bug isn't reported three times |
+| `analysis/analyzer.py` | Phase B conductor: rule → gated verdict |
 
 ---
 
-# SECTION C — PHASE A: the journey of `bank.py` through our code
+# PART 1 — PHASE A (indexing): why each stage exists
 
-*Trace format: **HOP — `file.function()` → real code → what it does → data out → next hop.***
+*The payload: `bank.py`, a 100-line file with 2 planted bugs. It enters at the [Index ▼] button, which calls `Indexer.index_repository()` — and that function's whole job is to make the file *findable by meaning* later.*
 
-## Hop 1 — `ingestion/indexer.py · Indexer.index_repository()` — the conductor
+## Stage A1 — File discovery · `file_discovery.discover_source_files()`
 
-```python
-def index_repository(self, root):                          # indexer.py:82
-    manifest = self._load_manifest()                       # cache: .chroma/manifest.json
-    skipped = discover_unsupported_files(root)             # → hop 2b (visibility)
-    for path in discover_source_files(root, self.max_file_bytes):  # → hop 2
-        rel = path.relative_to(root).as_posix()            # "bank.py"
-        language = detect_language(path)                   # → hop 3
-        if language is None: continue
-        file_hash = self._file_hash(path)                  # sha256 of content
-        cached = manifest.get(rel)
-        if cached and cached.get("hash") == file_hash:     # unchanged → skip re-embed
-            stats.files_reused_from_cache += 1; continue
-        if cached: self.store.delete(cached.get("unit_ids", []))  # changed → drop stale units
-        units = self.chunker.chunk_file(path, rel, language)      # → hop 4
-        embeddings = self.embedder.embed_texts([u.embedding_text() for u in units])  # → hop 6
-        self.store.add(units, embeddings)                  # → hop 7
-        new_manifest[rel] = {"hash": file_hash, "unit_ids": [u.id for u in units]}
-        stats.code_units += len(units)
-    self._save_manifest(new_manifest)
-    return stats                                           # IndexStats → 📊 UI tab
-```
+- ⚠️ **Problem:** A repo folder contains everything — `.git` history, `node_modules`, binaries, images, 200 MB logs. Feed those to a parser and you crash or waste hours; *ignore* them silently and users don't know what wasn't analyzed.
+- 🔧 **What we built:** a walker that filters by known extensions, skips vendor/VCS directories and oversized files, guards against binaries (`b"\x00"` sniff), returns files **sorted** for reproducibility — plus a sibling `discover_unsupported_files()` that reports everything it refused to read.
+- 💥 **What breaks without it:** indexing crawls through dependencies, dies on a corrupted file, or — worse — a `.txt` config with secrets is silently ingested while an unsupported `.rs` file is silently *never analyzed* and nobody is told.
 
-**What it does:** runs the same 4-step recipe for every file — chunk → embed → store → record. **Why the sha256 manifest:** re-indexing a 10k-file repo where one file changed costs *one* file's embeddings, not 10k; switching embedding models invalidates the cache wholesale (`indexer.py:91-96`). **Why stats:** `IndexStats` (files, lines, code_units, skipped, runtime) is what the 📊 tab shows — coverage honesty is a first-class output, not a log line.
+## Stage A2 — Language detection · `language_detector.detect_language()`
 
-## Hop 2 — `ingestion/file_discovery.py · discover_source_files()` — find the file
+- ⚠️ **Problem:** 8 supported languages must flow through identical downstream code; if every stage re-implements "what file is this?", adding a language becomes an 8-file edit.
+- 🔧 **What we built:** one `EXTENSION_MAP` (`.py → python`, …). The result is a single string that the parser, chunker and embedder all consume.
+- 💥 **What breaks without it:** no stable contract between discovery and parsing — Tree-sitter would guess grammars per call site, and "add Rust support" (2 map entries, by design) turns into touching the whole pipeline.
 
-```python
-for dirpath, dirnames, filenames in os.walk(root_path):        # file_discovery.py:26
-    dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
-    for name in filenames:
-        path = Path(dirpath) / name
-        if path.suffix.lower() not in EXTENSION_MAP: continue  # ".py" is known → keep
-        if path.stat().st_size > max_file_bytes: continue      # >1 MB → skip
-        with open(path, "rb") as fh:
-            if b"\x00" in fh.read(2048): continue              # binary guard → skip
-        files.append(path)
-return sorted(files)                                           # deterministic order
-```
+## Stage A3 — Tree-sitter parsing · `tree_sitter_parser.TreeSitterParser.parse()`
 
-**Data out:** `[.../bank.py]`. **Why sorted:** identical input ⇒ identical index ⇒ reproducible runs. **Why `discover_unsupported_files()` exists separately (line 44):** files we *can't* read are collected and shown as ⚠️ warnings instead of vanishing — never let "I didn't look" look like "I looked and it's clean."
+- ⚠️ **Problem:** Security rules care about *functions and classes*. Regex can't reliably find where `find_user_vulnerable` begins and ends (decorators, nesting, multi-line signatures, comments that look like code). Wrong boundaries → wrong line numbers → citations that fail validation later.
+- 🔧 **What we built:** a registry of 8 grammar adapters (`LANGUAGE_SPECS`), loaded lazily and cached; `parse()` turns raw bytes into a real syntax tree. Symbol names come from the AST (`node_name()`), with per-language fallbacks (C declarator chains, Go type specs).
+- 💥 **What breaks without it:** chunk boundaries become guesswork — evidence cites line 19 when the function actually starts at line 17, and the *entire verification layer's* line numbers become unreliable. Also: the "safe twin next to the bug" layout in `bank.py` (line 24 vs line 15) could not be told apart structurally.
 
-## Hop 3 — `ingestion/language_detector.py · detect_language()` — name the language
+## Stage A4 — Semantic chunking · `semantic_chunker.chunk_source()`
 
-```python
-return EXTENSION_MAP.get("." + name.rsplit(".", 1)[-1].lower())   # language_detector.py:38
-#   "bank.py"  →  ".py"  →  "python"
-```
+- ⚠️ **Problem:** LLMs and embedding models have limited context. Splitting files into arbitrary N-line windows cuts functions in half, destroys the "which rule does this function violate" mapping, and makes retrieved snippets meaningless on their own.
+- 🔧 **What we built:** walk the AST, emit one `CodeUnit` per real construct (function/method/class), byte-slicing the *exact* original source (`source[start_byte:end_byte]` — comments, indentation, bugs included), each with a stable sha1-based id and 1-based line range. Fallback: a file with no constructs becomes one `module` unit so it's still retrievable. A 6000-char cap keeps one giant function from blowing the prompt budget.
+- 💥 **What breaks without it:** retrieval returns fragments of half-functions; the LLM judges code missing its signature or its body; and evidence snippets no longer match the file on disk, so even *true* findings get rejected by the validator.
 
-**Data out:** the string `"python"` — the *only* language knowledge every later stage receives; parser, chunker and embedder are all language-generic. **Why:** adding a language = one `EXTENSION_MAP` entry + one `LANGUAGE_SPECS` entry, nothing else (the file's own docstring, lines 3-4, promises exactly this).
+## Stage A5 — Embedding · `embeddings/embedder.embed_texts()`
 
-## Hop 4 — `semantic_chunker.chunk_file()` → `tree_sitter_parser.TreeSitterParser.parse()` — text becomes a tree
+- ⚠️ **Problem:** "SQL injection" and `cursor.execute(f"SELECT ...")` share **zero keywords** — a search engine matches the first, misses the second. Rules and code must be comparable by *meaning*.
+- 🔧 **What we built:** one local model (all-MiniLM-L6-v2, 384 dims) embeds both code units *and* rules — code gets a metadata header prefix (`file: … / function: …`) so the model knows what it's reading. `embed_texts` and `embed_queries` are guaranteed to be the same space by an abstract base class. A deterministic hashing backend exists so tests and offline runs never depend on a model download.
+- 💥 **What breaks without it:** you're back to keyword search — the rule "commands executed via shell" never retrieves `os.system(f"ping {host}")`; or worse, documents and queries are embedded by *different* models, and cosine similarity compares incompatible coordinate systems (retrieval silently returns garbage).
 
-```python
-# semantic_chunker.py:25
-def chunk_file(self, path, rel_path, language):
-    source = Path(path).read_bytes()
-    return self.chunk_source(source, rel_path, language)
+## Stage A6 — Vector store + cache · `chroma_store.add()` / `indexer` manifest
 
-# semantic_chunker.py:29
-def chunk_source(self, source, rel_path, language):
-    tree = self.parser.parse(source, language)      # parser.py:124 → Tree-sitter grammar("python")
-    spec = LANGUAGE_SPECS[language]                 # python → ("function_definition",), ("class_definition",)
-    wanted = set(spec.function_nodes) | set(spec.class_nodes)
-```
+- ⚠️ **Problem:** Embedding is the slowest part of indexing; re-embedding 10k unchanged files every run is unacceptable. And the index must answer "top-8 most similar" instantly at query time.
+- 🔧 **What we built:** Chroma (local, persistent, cosine) stores vector + full code text + metadata per unit — so query time needs no file reads. A sha256 manifest records each file's content hash + unit ids: unchanged file → skip entirely; changed file → delete stale units, re-embed just that one; **different embedding model → wipe everything** (mixing spaces would corrupt retrieval).
+- 💥 **What breaks without it:** every analysis run pays full indexing cost; edited files leave ghost units of deleted code that still get retrieved and "verified" against nothing; or vectors from two models coexist and similarity scores become meaningless.
 
-**Data out:** a Tree-sitter `Tree` over all 100 lines + the set of node types that count as units. **Why an AST, not line slices:** only the grammar knows `find_user_vulnerable` starts at line 15 and ends at line 21 — exact boundaries make both chunking and later citation possible. The grammar itself is loaded lazily (`parser.py:101-117`): first Python file → import `tree_sitter_python`, cache the `Language` forever.
+> **End of Phase A:** `bank.py` is now 15 `CodeUnit`s + 15 vectors on disk, `IndexStats` returned to the UI (files, units, skipped, runtime), **$0 spent, 0 LLM calls**. The file waits for a rule to come looking for it.
 
-## Hop 5 — `semantic_chunker._add_unit()` — the tree becomes `CodeUnit` objects
+---
 
-```python
-# semantic_chunker.py:35-50 — recursive walk
-def visit(node):
-    if node.type == "decorated_definition": …unwrap decorators…
-    if node.type in wanted:                          # function_definition / class_definition
-        self._add_unit(node, node, source, rel_path, language, spec, units)
-    for child in node.children: visit(child)         # → also finds Account's 3 methods
-visit(tree.root_node)
-if not units:                                       # fallback: whole file = one "module" unit
-    units.append(CodeUnit(..., type="module", start_line=1, end_line=lines, ...))
+# PART 2 — PHASE B (analysis): why each stage exists
 
-# semantic_chunker.py:61-75 — one unit from one node
-code = source[extent_node.start_byte:extent_node.end_byte].decode("utf-8", "replace")
-units.append(CodeUnit(
-    file=rel_path, language=language,
-    symbol=node_name(node, source),                 # "find_user_vulnerable" (parser.py:128)
-    type=type_label,                                # "function" | "class" | "method" ...
-    start_line=extent_node.start_point[0] + 1,      # Tree-sitter rows are 0-based → 1-based here
-    end_line=extent_node.end_point[0] + 1,
-    code=self._cap(code),                           # 6000-char guard (line 77)
-))
-```
+*The payload now: `security_rules.json` (2 rules — SQL-001, CMD-001) + the index from Phase A. The [Analyze ▼] button calls `SecurityAnalyzer.analyze(rules)` — its job is to produce verdicts **that can be trusted more than the model that wrote them**.*
 
-**Data out:** 15 `CodeUnit` records — the dataclass in `models/schemas.py:19` whose `__post_init__` mints each a stable id: `sha1("bank.py|find_user_vulnerable|15|21")[:16]`. **Why byte-slicing:** `source[start_byte:end_byte]` copies the *exact* original bytes — indentation, comments, the bug on line 19 — no reconstruction, no drift. **Why the module fallback (line 51):** a script with zero definitions is still retrievable instead of silently invisible. **Why `_cap`:** one pathological 10k-line function can't blow up the prompt budget.
+## Stage B1 — Rules as data · `load_rules()` → `SecurityRule.from_dict()`
 
-## Hop 6 — `embeddings/embedder.py · embed_texts()` — code becomes numbers
+- ⚠️ **Problem:** If rules live in code (`if rule == "SQL": ...`), every new check is a code change, a re-review, a redeploy. Hard-coding 2 rules also *lies* about the design — the tool claims to be general.
+- 🔧 **What we built:** rules arrive as JSON, validated into `SecurityRule` (4 required fields; missing field → named error at load time, not a broken prompt later). `render()` produces the one canonical text that gets embedded.
+- 💥 **What breaks without it:** analysts can't add checks without a developer; a typo'd rule silently retrieves nonsense; and the same rule could render differently in different paths, making retrieval irreproducible.
+
+## Stage B2 — The per-rule loop · `SecurityAnalyzer.analyze()`
+
+- ⚠️ **Problem:** A report must cover N rules with consistent accounting — how many calls, tokens, retrievals — and scale past the 2 demo rules without redesign.
+- 🔧 **What we built:** a plain `for rule in rules` loop, no caps, no special cases; every metric increments inside the loop, so the numbers on screen *are* the numbers from the code. Empty retrieval short-circuits to INCONCLUSIVE **before** any paid call.
+- 💥 **What breaks without it:** metrics drift into estimates, adding a third rule needs a new branch, and an empty index burns money asking the LLM about nothing.
+
+## Stage B3 — Top-K retrieval · `retriever.retrieve()` → `chroma_store.query()`
+
+- ⚠️ **Problem:** Feeding the LLM the whole repo is slow, expensive, and *hurts* accuracy — the model drowns in irrelevant code. Sending nothing means it invents.
+- 🔧 **What we built:** embed the rule (`rule.render()`) in the *same* space as Phase A, ask Chroma for the 8 closest units (cosine distance → similarity via `1.0 - dist`). The docstring enforces the philosophy: retrieval answers *"what's relevant?"* — never *"is it vulnerable?"* Scores only order context; they never decide verdicts.
+- 💥 **What breaks without it:** context overflow on real repos (cost ×10), or the subtle failure — the LLM treats "top-ranked" as "guilty" and convicts `find_user_safe` because it *looks like* its vulnerable twin next door.
+
+## Stage B4 — The strict prompt · `prompts.SYSTEM_PROMPT` + `build_user_prompt()`
+
+- ⚠️ **Problem:** Left free-form, an LLM answers any security question fluently and fabricates: invented paths, invented lines, code "remembered" instead of read.
+- 🔧 **What we built:** a system prompt that *forbids* exactly those moves — analyze only supplied code; don't invent files/lines/functions; **similarity is not proof**; insufficient context → INCONCLUSIVE; every evidence item must copy the exact snippet and header fields. The user prompt frames units as *"candidate context, may contain false positives"* and demands strict JSON back.
+- 💥 **What breaks without it:** you have a chatbot again — plausible prose, unverifiable claims — precisely the failure this project eliminates. Note the design: the prompt *demands* receipts, but we still don't *trust* it (see B6).
+
+## Stage B5 — One deterministic call · `OpenRouterClient.chat()`
+
+- ⚠️ **Problem:** The LLM layer is the only paid, external, non-repeatable dependency — it must fail loudly, cost a predictable amount, and give the same answer twice.
+- 🔧 **What we built:** exactly one HTTP call per rule at `temperature 0.0` (deterministic), 120 s timeout, non-200 → `RuntimeError` (never a silent empty response that reads as "no findings"), token usage returned and accumulated into `AnalysisMetrics`.
+- 💥 **What breaks without it:** flaky runs where yesterday's VULNERABLE is today's SAFE for no reason; provider errors swallowed into green checkmarks; and cost nobody can explain to a budget holder.
+
+## Stage B6 — Evidence validation · `EvidenceValidator.validate()`
+
+- ⚠️ **Problem:** **This is the core problem of the entire project.** The LLM's JSON looks identical whether it was derived from your code or hallucinated. Display its citations unchecked and one invented file/line destroys the tool's credibility forever.
+- 🔧 **What we built:** every evidence item is fact-checked against the real repository — three gates: (1) the file exists (exact → suffix → basename resolution: forgiving *path format*, never nonexistent files); (2) the line number is in range; (3) the cited snippet actually appears in the file (whitespace-normalized — re-indentation passes, **invented code fails**). Each item gets `valid` + a readable `validation_reason`; rejected claims are kept and shown, not hidden.
+- 💥 **What breaks without it:** the tool becomes "a chatbot with a UI" — one day it flags `payment.py:404`, a file you don't have, and everything it ever said becomes suspect too. **Without this stage there is no difference between this project and asking ChatGPT.**
+
+## Stage B7 — Dedup + the downgrade gate · `analyzer._analyze_rule()` lines 104-123
+
+- ⚠️ **Problem:** Two failure modes sneak past a perfect validator: (1) the *same* bug cited twice — via the class chunk and the method chunk — inflating apparent severity; (2) the LLM says VULNERABLE but **every** evidence item fails validation — a confident verdict with zero receipts.
+- 🔧 **What we built:** dedup on `(rule_id, file, function, line)`, then the gate — four lines:
 
 ```python
-# indexer.py:123 — what actually gets embedded:
-embeddings = self.embedder.embed_texts([u.embedding_text() for u in units])
-
-# models/schemas.py:46 — the text form (header + code):
-def embedding_text(self):
-    return (f"file: {self.file}\nlanguage: {self.language}\n"
-            f"{self.type}: {self.symbol}\n{self.code}")
-
-# embedder.py:47 — the model call
-def embed_texts(self, texts):
-    return [[float(x) for x in vec]
-            for vec in self._model.encode(list(texts), convert_to_numpy=True)]
-```
-
-**Data out:** 15 vectors × 384 floats. **Why the header prefix:** MiniLM doesn't parse Python — telling it "function: find_user_vulnerable in bank.py" frames the meaning before the code starts. **Why `embed_texts`/`embed_queries` share one model (embedder.py:1-4):** code and rules must be compared in the *same* vector space; two models would be two incompatible coordinate systems. **Why the hashing fallback (line 54):** if the model can't download, the pipeline degrades to a deterministic offline embedder instead of dying — tests run with zero network.
-
-## Hop 7 — `vector_store/chroma_store.py · add()` — vectors hit the disk
-
-```python
-self._collection.upsert(                          # chroma_store.py:33
-    ids=[u.id for u in units],                    # "ab12…" stable sha1-based ids
-    embeddings=embeddings,                        # the 384-float vectors
-    documents=[u.code for u in units],            # full source — needed later for the prompt
-    metadatas=[u.to_metadata() for u in units],   # file/language/symbol/type/start_line/end_line
-)
-```
-
-**Data out:** a persistent `code_units` collection inside `.chroma/` using **cosine** distance (`chroma_store.py:24`). **Why store the code text too:** at query time the retriever must return readable source for the prompt — no second file read, no drift if the file changed after indexing. **Why `upsert`:** re-indexing the same unit overwrites instead of duplicating.
-
-> **Phase A ends here.** `bank.py` has been transformed: `Path → bytes → Tree → 15×CodeUnit → 15×[384 floats] → .chroma on disk`, and `IndexStats{files:1, code_units:15, …}` is returned to the UI. Zero LLM calls, zero dollars. The file now waits for a rule to come looking for it.
-
-# SECTION D — PHASE B: the journey of a rule through our code
-
-## Hop 8 — `app.py · load_rules()` → `models/schemas.py · SecurityRule` — rules become data
-
-```python
-# app.py:85-110 — whichever input method was chosen, it ends here:
-SecurityRule.from_dict(obj)                       # schemas.py:67 — validates the 4 required fields,
-                                                  # raises "missing fields: [...]" if any absent
-# schemas.py:81 — how a rule will later be embedded:
-def render(self):
-    return (f"Security category: {self.category}\n"
-            f"Severity: {self.severity}\n"
-            f"Requirement: {self.requirement}")
-```
-
-**Data out:** `[SecurityRule(SQL-001…), SecurityRule(CMD-001…)]`. **Why validation at construction:** a malformed rule fails *here*, with a field name, instead of deep inside the LLM prompt. **Why `render()`:** the exact text that gets embedded — one canonical string, produced by the data class itself.
-
-## Hop 9 — `analysis/analyzer.py · SecurityAnalyzer.analyze()` — the per-rule loop
-
-```python
-def analyze(self, rules):                          # analyzer.py:47
-    for rule in rules:                             # line 50: arbitrary count, no caps, no special cases
-        result = self._analyze_rule(rule, report.metrics)
-        report.results.append(result)
-        report.metrics.rules_analyzed += 1
-    return report                                  # AnalysisReport{results, metrics}
-
-def _analyze_rule(self, rule, metrics):            # analyzer.py:57
-    retrieved = self.retriever.retrieve(rule, top_k=self.top_k)   # → hop 10
-    metrics.retrievals += 1
-    if not retrieved:                              # empty index → honest INCONCLUSIVE, no LLM spend
-        return RuleResult(rule=rule, status="INCONCLUSIVE", ...)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT},      # → hop 12
-                {"role": "user",   "content": build_user_prompt(rule, retrieved)}]  # → hop 11
-    metrics.llm_calls += 1
-    response = self.llm.chat(messages)             # → hop 13
-    ...
-```
-
-**Why the loop lives here and nowhere else:** every cross-cutting concern (retrieval count, token accounting, call count) increments once per rule — `metrics.llm_calls` at line 72 *is* the number shown in the UI. **Why `if not retrieved` short-circuits:** don't burn a paid LLM call when there's nothing to judge.
-
-## Hop 10 — `retrieval/retriever.py · Retriever.retrieve()` — rule asks the index
-
-```python
-def retrieve(self, rule, top_k=8):                 # retriever.py:20
-    query_embedding = self.embedder.embed_queries([rule.render()])[0]   # same model as hop 6
-    return self.store.query(query_embedding, top_k=top_k)
-```
-
-…and inside Chroma (`chroma_store.py:47-73`):
-
-```python
-result = self._collection.query(
-    query_embeddings=[embedding], n_results=top_k,
-    include=["documents", "metadatas", "distances"])   # cosine distances
-for uid, doc, meta, dist in zip(...):
-    unit = CodeUnit(file=meta["file"], ..., code=doc, id=uid)   # rebuild CodeUnit from metadata
-    units.append(RetrievedUnit(unit=unit, score=1.0 - float(dist)))  # distance → similarity
-```
-
-**Data out:** 8 `RetrievedUnit{unit, score}` — for SQL-001 the top rows are `find_user_vulnerable`, `find_user_safe`, `export_users_vulnerable`… (scores illustrative). **Why `1.0 - dist`:** Chroma returns *distance* (lower=better); the UI and prompt speak *similarity* (higher=better) — this line is the unit conversion. **Why the module docstring's warning (retriever.py:3-5) matters:** this stage answers "what's relevant?", never "is it vulnerable?" — a score never appears in a verdict, only in context.
-
-## Hop 11 — `llm/prompts.py · build_user_prompt()` — context becomes a question
-
-```python
-parts = ["SECURITY RULE:",
-         f"  id: {rule.rule_id}", f"  severity: {rule.severity}",
-         f"  category: {rule.category}", f"  requirement: {rule.requirement}",
-         "", "RETRIEVED CODE UNITS (candidate context, may contain false positives):"]
-for i, item in enumerate(retrieved, 1):             # prompts.py:59
-    u = item.unit
-    parts.append(f"\n--- UNIT {i} ---\nfile: {u.file}\nlanguage: {u.language}\n"
-                 f"{u.type}: {u.symbol}\nlines: {u.start_line}-{u.end_line}\n"
-                 f"similarity: {item.score:.4f}\ncode:\n{u.code}")
-parts.append("\nDecide whether the rule is VIOLATED by the supplied code. "
-             "Return strict JSON only.")
-```
-
-**Data out:** one ~1-2k-token string. **Why "may contain false positives" is printed into the prompt:** the model is *told* retrieval is only candidate generation — that single line is a hallucination speed bump. **Why numbered `UNIT n` headers:** gives the model a shared vocabulary for referencing candidates, and forces every unit to declare file/lines the evidence can later cite.
-
-## Hop 12 — `llm/prompts.py · SYSTEM_PROMPT` — the standing law (lines 12-45)
-
-The system prompt's load-bearing clauses, verbatim:
-
-- *"Analyze ONLY the supplied code. Do not invent source code."*
-- *"Do not invent files. Do not invent line numbers. Do not invent functions."*
-- *"Semantic similarity of the retrieved code to the rule is NOT proof of a vulnerability."*
-- *"Every piece of evidence MUST be verifiable against the supplied code: copy the exact code snippet and use the exact file, line, and function from the supplied code-unit headers."*
-- Output = strict JSON only: `{status, confidence, reason, evidence:[{file,line,function,code,reason}]}`
-
-**Why each exists:** clause 2 kills fabricated paths, clause 3 convicts no one for being *similar* (that's how `find_user_vulnerable` and `find_user_safe` get told apart), clause 4 is the contract the evidence validator enforces — the prompt *demands* receipts, the validator *checks* them.
-
-## Hop 13 — `llm/openrouter_client.py · OpenRouterClient.chat()` — the only network call that costs money
-
-```python
-response = requests.post(                                   # openrouter_client.py:36
-    f"{self.base_url}/chat/completions",
-    headers={"Authorization": f"Bearer {self.api_key}", ...},
-    json={"model": self.model, "messages": messages,
-          "temperature": self.temperature},                 # 0.0 from Config (config.py:20)
-    timeout=self.timeout_seconds)
-if response.status_code != 200:
-    raise RuntimeError(f"OpenRouter error {response.status_code}: …")   # loud, never silent
-choice = data["choices"][0]["message"]
-return LLMResponse(content=..., prompt_tokens=...)          # tokens flow into AnalysisMetrics
-```
-
-**Data out:** `LLMResponse{content: "<JSON text>", prompt_tokens, completion_tokens}`. **Why temperature 0.0:** rerunning the same analysis must give the same verdicts — determinism is a feature of a security tool. **Why raise on non-200 instead of returning empty:** a failed call must never masquerade as "no findings."
-
-## Hop 14 — `llm/prompts.py · parse_llm_json()` — the answer comes back structured
-
-```python
-cleaned = text.strip()
-if cleaned.startswith("```"):                              # strip fences if the model added them anyway
-    cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned); cleaned = re.sub(r"\s*```$", "", cleaned)
-try:
-    data = json.loads(cleaned)
-except json.JSONDecodeError:                               # fall back: grab the {...} block
-    match = _JSON_BLOCK_RE.search(cleaned)
-    if not match: raise ValueError(f"LLM response is not JSON: …")
-    data = json.loads(match.group(0))
-```
-
-**Data out:** a dict `{status, confidence, reason, evidence:[…]}` — or a `ValueError` that `analyzer.py:78-85` converts into an honest **INCONCLUSIVE** carrying the raw response. **Why this tolerance:** models sometimes wrap JSON in fences anyway; being 95% strict on *format* while 100% strict on *verification* is the right trade — the validator, not the parser, is where correctness is enforced.
-
-## Hop 15 — `analysis/evidence_validator.py · EvidenceValidator.validate()` — fact-checking against disk
-
-```python
-def validate(self, evidence: dict):                        # evidence_validator.py:52
-    item = EvidenceItem(file=..., line=..., function=..., code=..., reason=...)
-    if not item.file:
-        item.validation_reason = "rejected: no file given"; return item
-    path, resolved_rel = self._resolve_file(item.file)     # exact → suffix → basename (line 34)
-    if path is None:
-        item.validation_reason = f"rejected: file '{item.file}' does not exist"; return item
-    lines = path.read_text(...).splitlines()
-    if item.line < 1 or item.line > len(lines):
-        item.validation_reason = f"rejected: line {item.line} out of range …"; return item
-    if item.code:
-        if _normalize(item.code) not in _normalize(content):      # whitespace-insensitive
-            item.validation_reason = "rejected: cited code not found in file (possible fabrication)"
-            return item
-    item.valid = True
-    item.validation_reason = "verified against repository"
-```
-
-**Data out:** each `EvidenceItem` gains `valid=True/False` + a human-readable `validation_reason`.
-
-**Walk the real SQL-001 claim through it:** `{file:"bank.py", line:19, code:"query = \"SELECT * … username …\""}` → `_resolve_file` finds `bank.py` ✓ → line 19 of 100 in range ✓ → normalized snippet found in normalized file ✓ → **valid, 3/3**. Now a hallucinated `{file:"payment.py", line:404}` → `_resolve_file` finds nothing → **rejected**, reason recorded.
-
-**Why `_resolve_file`'s three-tier match (exact → suffix → basename):** LLMs write `./bank.py` or bare `bank.py`; forgiving the *path format* while never forgiving a *nonexistent file* keeps real findings and drops fakes. **Why `_normalize` (line 18):** the model may re-indent a snippet — that's sloppiness, not fabrication; fabrication is *code that appears nowhere in the file*, and that's what gets rejected.
-
-## Hop 16 — back in `analyzer.py`: dedup + the downgrade gate (lines 104-123)
-
-```python
-unique_findings = deduplicate_findings([...])              # key: (rule_id, file, function, line)
-...
-if status == "VULNERABLE" and not deduped:                 # analyzer.py:120 — THE GATE
+if status == "VULNERABLE" and not deduped:
     status = "INCONCLUSIVE"
-    reason += (" [downgraded: no evidence item could be verified "
-               "against the repository]")
-return RuleResult(rule=rule, status=status, confidence=..., reason=...,
-                  evidence=deduped, retrieved=retrieved, raw_response=response.content)
+    reason += " [downgraded: no evidence item could be verified against the repository]"
 ```
 
-**What it does:** collapses duplicate citations (class chunk + method chunk pointing at the same line), then applies the project's central invariant — **a VULNERABLE status with zero verified evidence cannot leave this function.** **Why here and not in the UI:** the gate sits inside the domain logic, so *every* consumer (UI, JSON download, tests) receives only gated results; presentation layers physically cannot render an unbacked conviction.
+  It lives *inside* the analyzer, not the UI, so every consumer — screen, JSON download, tests — can only ever see gated results.
+- 💥 **What breaks without it:** a new export path forgets the check and renders an unbacked conviction; duplicates make 1 bug look like 3; the report's VULNERABLE count stops meaning anything.
 
-## Hop 17 — back to `app.py` (lines 221-248): the report becomes pixels
+## Stage B8 — Report assembly & display · `AnalysisReport.to_dict()` → `app.py`
 
-```python
-report = st.session_state.report
-for result in report["results"]:                           # one expander per rule
-    header = f"{result['rule_id']} [{result['severity']}] {result['category']} -> {result['status']} …"
-    with st.expander(header, expanded=result["status"] == "VULNERABLE"):
-        st.dataframe(result["retrieved"])                  # all 8 candidates + scores
-        st.dataframe(result["evidence"])                   # only validator-approved rows
-cols[0].metric("Rules analyzed", m["rules_analyzed"])      # … 6 metric tiles total
-cols[2].metric("LLM calls", m["llm_calls"])                # shows: 2
-st.download_button("Download report (JSON)", json.dumps(report, indent=2), …)
-```
-
-**Data out:** the final screen — one expander per rule, **retrieved** and **evidence** tables side by side, six honest metrics, downloadable JSON of the same dict. **Why show `retrieved` AND `evidence`:** the audience sees exactly what was *considered* vs. what was *proven* — the pipeline's whole philosophy, rendered as UI.
-
-# SECTION E — The data-shape cheat sheet (what the payload IS at every hop)
-
-| After hop | File / function | The payload is… |
-|---|---|---|
-| 0 | `app.py` button | a folder path containing `bank.py` (100 lines of text) |
-| 1-2 | `file_discovery.discover_source_files` | `list[Path]` — `[bank.py]` |
-| 3 | `language_detector.detect_language` | `"python"` |
-| 4 | `tree_sitter_parser.parse` | a Tree-sitter `Tree` (AST of all 100 lines) |
-| 5 | `semantic_chunker.chunk_source` | `list[CodeUnit]` — 15 records, stable sha1 ids |
-| 6 | `embedder.embed_texts` | `list[list[float]]` — 15 × 384 |
-| 7 | `chroma_store.add` | rows in `.chroma/` (id + vector + code + metadata) |
-| 8 | `load_rules` / `SecurityRule.from_dict` | `list[SecurityRule]` — 2 rules |
-| 10 | `retriever.retrieve` | `list[RetrievedUnit]` — top-8 `{unit, score}` |
-| 11-12 | `build_user_prompt` + `SYSTEM_PROMPT` | one chat `messages` list (system + user strings) |
-| 13 | `OpenRouterClient.chat` | `LLMResponse{content: JSON text, tokens}` |
-| 14 | `parse_llm_json` | `dict{status, confidence, reason, evidence[]}` |
-| 15 | `EvidenceValidator.validate` | `EvidenceItem{…, valid: bool, validation_reason}` |
-| 16 | `analyzer._analyze_rule` | `RuleResult` (gated: no receipts ⇒ no VULNERABLE) |
-| 17 | `app.py` report block | `report dict` → screen tables + metrics + JSON download |
-
-**One-glance call graph:**
-
-```
-app.py ──[Index]──▶ Indexer.index_repository
-                       ├─ discover_source_files ─▶ [Path]
-                       ├─ detect_language        ─▶ "python"
-                       ├─ SemanticChunker.chunk_file ─▶ parse() ─▶ [CodeUnit]
-                       ├─ embedder.embed_texts   ─▶ [[f;f;…]]
-                       └─ ChromaStore.add        ─▶ .chroma/  (+ IndexStats → UI)
-
-app.py ──[Analyze]──▶ SecurityAnalyzer.analyze ── for each rule:
-                       ├─ Retriever.retrieve ─▶ embed(rule.render()) → ChromaStore.query → top-8
-                       ├─ build_user_prompt + SYSTEM_PROMPT ─▶ messages
-                       ├─ OpenRouterClient.chat ─▶ LLMResponse (temp 0.0)
-                       ├─ parse_llm_json ─▶ verdict dict
-                       ├─ EvidenceValidator.validate (×N evidence) ─▶ valid flags
-                       ├─ deduplicate_findings + downgrade gate ─▶ RuleResult
-                       └─ AnalysisReport.to_dict() ─▶ app.py render → screen + JSON
-```
-
-## Takeaways
-
-1. **Two orchestrators, seventeen hops.** `Indexer.index_repository` (Phase A: text → vectors, once, free) and `SecurityAnalyzer.analyze` (Phase B: rule → verdicts, per rule, paid) — every other file is a single-purpose helper in one of those chains.
-2. **The payload's shape is never a surprise** — each hop has a declared input and output type (table above), and the shapes live once in `models/schemas.py`.
-3. **Trust is engineered at hops 15-16:** the prompt *demands* citations, the validator *checks them against disk*, the gate *destroys* unbacked verdicts — all before anything reaches the screen.
-4. **Honesty is structural:** skipped files, empty retrievals, parse failures and token counts all surface as visible states (⚠️ / INCONCLUSIVE / metric tiles), never as silence.
-5. **Extension points fall out of the design:** new language → 2 map entries; new rule → 1 JSON object; new LLM → 1 class with `.chat()`; nothing else moves.
+- ⚠️ **Problem:** A report that shows only conclusions forces readers to trust the tool blindly; estimated (or missing) metrics invite skepticism.
+- 🔧 **What we built:** each rule's result carries **retrieved** (all 8 candidates + scores) *and* **evidence** (only validator-approved rows) side by side; six metric tiles (rules, retrievals, LLM calls, prompt/completion tokens, runtime) are counted, not estimated; full report downloads as JSON; VULNERABLE expanders open by default.
+- 💥 **What breaks without it:** no auditor can tell "candidate" from "proven"; "2 LLM calls" becomes marketing copy instead of a countable fact; and the demo's central claim — *these two citations survived disk verification* — has nowhere to be shown.
 
 ---
 
-*Reading path: A (map) → B (entry) → C (Phase A, hops 1-7) → D (Phase B, hops 8-17) → E (shapes + call graph). All quoted code is from this repository; line numbers exact. End of document.*
+# PART 3 — The cross-cutting "whys" (things that shape *every* stage)
 
+## C1 — Config objects instead of constants · `config.py`
 
+- ⚠️ **Problem:** Hard-coded API keys leak; hard-coded models/thresholds make every experiment a code edit.
+- 🔧 **What we built:** one `Config.from_env()` dataclass — key, model, temperature, top-K, dirs, chunk caps — read from `.env` once at startup.
+- 💥 **Without it:** secrets end up in git, and "try top-K=16" means editing source, committing, and re-reviewing a diff that shouldn't have changed.
 
+## C2 — Shared data shapes · `models/schemas.py`
+
+- ⚠️ **Problem:** 16 files passing dicts around means every module guesses the others' keys; a renamed field becomes a runtime `KeyError` three hops from the change.
+- 🔧 **What we built:** all contracts live in one file — `CodeUnit`, `SecurityRule`, `RetrievedUnit`, `EvidenceItem`, `RuleResult`, `AnalysisMetrics`, plus `ALLOWED_STATUSES`. The module docstring states the design: *everything downstream of Tree-sitter treats every language identically; the only contract is the `CodeUnit` shape.*
+- 💥 **Without it:** the parser, retriever, validator and UI each redefine "a finding" slightly differently — and the inconsistencies only surface at runtime, mid-demo.
+
+## C3 — Constructor injection · `app.py` wiring
+
+- ⚠️ **Problem:** If `SecurityAnalyzer` did `import OpenRouterClient` itself, tests would need real API keys, and swapping providers would mean editing domain logic.
+- 🔧 **What we built:** `app.py` constructs the embedder, store, retriever, LLM and validator, then *hands them in*. `SecurityAnalyzer` only knows interfaces.
+- 💥 **Without it:** the test suite's fake LLM (and the offline hashing embedder) become impossible; CI needs secrets; the project can't run in a classroom with no internet.
+
+## C4 — Honesty as a feature (visible failure states)
+
+- ⚠️ **Problem:** The dangerous output of a security tool isn't a wrong verdict — it's **silence that looks like success**: skipped files nobody mentioned, a provider outage rendered as "0 findings", unparseable LLM output dropped quietly.
+- 🔧 **What we built:** every failure has a visible state — ⚠️ skip list in the UI; `INCONCLUSIVE` with a reason string (including the parse-failure text and the downgrade note); `RuntimeError` on HTTP errors; metric tiles for *everything* (even when `LLM calls = 0`, the report says so); scores labeled illustrative.
+- 💥 **Without it:** users over-trust green checkmarks — the exact failure mode (confident, unverifiable answers) the project was created to fix, reproduced *by the tool itself*.
+
+---
+
+# PART 4 — The one-table summary (speaker's recap)
+
+| Stage | Problem it solves | What breaks without it |
+|---|---|---|
+| A1 File discovery | Repo = noise (binaries, vendor, huge files) | Slow runs, crashes, silent coverage gaps |
+| A2 Language detect | One contract for 8 languages | Every stage guesses; new language = 8 edits |
+| A3 Tree-sitter parse | Real function/class boundaries | Wrong line numbers → validator rejects true findings |
+| A4 Semantic chunk | Context limits; meaningful units | Half-functions retrieved; snippets can't be verified |
+| A5 Embedding | Meaning-based rule↔code matching | Keyword search misses `os.system(f…)`; mixed spaces = garbage |
+| A6 Store + cache | Fast queries; no re-embedding | Full cost every run; ghost units of deleted code |
+| B1 Rules as data | Checks change without code changes | Analysts blocked; irreproducible rendering |
+| B2 Per-rule loop | Counted metrics; N rules | Estimated numbers; 3rd rule = redesign |
+| B3 Top-8 retrieval | Right context, not all context | Cost explosion *or* top-ranked = presumed guilty |
+| B4 Strict prompt | Forbids fabrication up front | Back to a chatbot with invented citations |
+| B5 Temp-0.0 call | Deterministic, loud, budgeted | Non-reproducible verdicts; silent provider failures |
+| B6 Evidence validator | **Citations checked against disk** | **Indistinguishable from asking ChatGPT** |
+| B7 Dedup + gate | No duplicates; no receipt-less verdicts | 1 bug → 3 findings; VULNERABLE with zero proof |
+| B8 Report | Candidates vs proven, counted metrics | Blind trust; un-auditable claims |
+| C1-C4 Cross-cutting | Config / schemas / injection / honesty | Leaked keys, runtime KeyError, untestable, false calm |
+
+**The 30-second version, for the last slide:**
+
+> We took a repo that a raw LLM would *guess* about, and built a pipeline where the repo is indexed once by grammar-accurate parsers, each rule retrieves only what's relevant, the LLM reasons under strict orders at temperature zero, and — the part that matters — **every sentence it cites is verified against the actual files before you're allowed to see it.** If verification finds nothing, the verdict is downgraded in code, not by policy. That's why the output is evidence, not vibes.
+
+**Suggested flow when presenting:** Part 0 (2 min) → click through the app: Index, then Analyze (2 min) → one stage at a time using the ⚠️/🔧/💥 triple (8-10 min) → Part 4 table as the recap slide (2 min) → the 30-second version as the closer.
+
+---
+
+*All file names and line numbers refer to this repository. Similarity scores and token counts mentioned are illustrative unless measured in a live run. End of document.*
 
 
 
