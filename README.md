@@ -1,11 +1,11 @@
-# 🎓 Live Walkthrough: 100 Lines of Code + 2 Security Rules
-### How the Verified RAG Security Analyzer works — end to end, every stage, real numbers
+# 🎓 How the Verified RAG Security Analyzer Works — Complete Walkthrough
+**One 100-line file. Two security rules. Every stage, every tree node, every number — no need to open the project.**
+
+**How to read this deck:** everything shown with `✔` is real output of the project's modules (module name given in each stage header). Numbers marked *illustrative* are plausible sample values; structure is always exact.
 
 ---
 
-## Slide 1 — The Two Inputs (nothing else is needed)
-
-### Input A: `bank.py` — exactly 100 lines, containing 2 hidden bugs
+## Slide 1 — Input A: `bank.py` (exactly 100 lines, 2 hidden bugs)
 
 ```python
   1  """MiniBank demo app - 100 lines with two intentional vulnerabilities."""
@@ -110,7 +110,7 @@
 100
 ```
 
-### Input B: `rules.json` — the 2 security rules (pure input data, nothing hardcoded)
+## Slide 2 — Input B: `rules.json` (2 rules, pure data — nothing about them is hardcoded in code)
 
 ```json
 [
@@ -121,157 +121,297 @@
 ]
 ```
 
-**Ground truth (what a human auditor knows):** line 19 violates SQL-001, lines 33-34 violate CMD-001. Everything else is safe. The analyzer must find exactly this — with proof.
+**Ground truth (what a human auditor knows):** line 19 violates SQL-001 · lines 33-34 violate CMD-001 · everything else is safe. The analyzer must find exactly this, with proof, zero false alarms.
 
 ---
 
-## Slide 2 — PHASE A: Indexing (once, local, FREE, no LLM)
+## Slide 3 — Module Map: which file does what (the whole project in 13 rows)
 
-### Stage 1 — File discovery (`ingestion/file_discovery.py`)
+| # | Stage | Module | Reads | Writes |
+|---|---|---|---|---|
+| 1 | Find files | `ingestion/file_discovery.py` | repo folder | file list + skipped list |
+| 2 | Detect language | `ingestion/language_detector.py` | filename | `"python"` |
+| 3 | Parse to AST | `ingestion/tree_sitter_parser.py` | source text | tree |
+| 4 | Chunk tree | `ingestion/semantic_chunker.py` | tree | 15 `CodeUnit`s |
+| 5 | Orchestrate index | `ingestion/indexer.py` | file list | `IndexStats` |
+| 5 | Embed | `embeddings/embedder.py` | texts | 384-dim vectors |
+| 5 | Store | `vector_store/chroma_store.py` | vectors | Chroma collection |
+| 6-7 | Rule render + retrieve | `retrieval/retriever.py` | rules | top-8 units |
+| 8 | Build prompt | `llm/prompts.py` | rule + units | messages |
+| 8 | Call LLM | `llm/openrouter_client.py` | messages | strict JSON |
+| 9 | Validate evidence | `analysis/evidence_validator.py` | JSON + disk | validity flags |
+| 10 | Dedup + verdicts | `analysis/deduplicator.py`, `analysis/analyzer.py` | all results | `AnalysisResult` |
+| UI | Streamlit app | `app.py`, `ui_explorer.py` | everything | report on screen |
 
-Walks the folder, finds `bank.py`. Skips `node_modules`, `.git`, files over 1 MB, binaries.
-Result: **1 file accepted.**
+Data shapes are frozen in `models/schemas.py`; knobs (`TOP_K=8`, chunk size, model names) in `config.py`.
 
-### Stage 2 — Language detection (`ingestion/language_detector.py`)
+---
+
+## Slide 4 — PHASE A, Stage 1-2: Discovery + Language Detection
+
+**`file_discovery.py`** walks the folder, finds `bank.py`; skips `node_modules/`, `.git/`, binaries, files over 1 MB, and records any unsupported extension for the UI warning. Result: **1 file accepted, 0 skipped.**
+
+**`language_detector.py`:**
+```
+"bank.py" -> splitext -> ".py" -> EXTENSION_MAP[".py"] -> "python"
+```
+`"python"` selects which Tree-sitter grammar parses the file. No hardcoded `.py` logic anywhere, adding a new language = adding an extension + a grammar.
+
+---
+
+## Slide 5 — PHASE A, Stage 3: The Abstract Syntax Tree of all 100 lines (`tree_sitter_parser.py`)
+
+Tree-sitter runs the **Python grammar** over the text. Every node carries a type and a `[start-end]` line range. This is the complete top-level tree (expression leaves collapsed; the two vulnerable functions expanded fully on the next slide):
 
 ```
-bank.py  ->  extension ".py"  ->  EXTENSION_MAP[".py"]  ->  "python"
+module  [1-100]
+├── expression_statement: string (docstring)        [1]
+├── import_statement (os)                           [2]
+├── import_statement (sqlite3)                      [3]
+├── import_statement (subprocess)                   [4]
+├── assignment: DB = "bank.db"                      [6]
+├── assignment: BACKUP_DIR = "/var/backups"         [7]
+│
+├── function_definition get_db                      [10-12]   <- chunk 1
+│   ├── parameters: ()                              [10]
+│   └── block                                       [11-12]
+│       ├── expression_statement: sqlite3.connect   [11]
+│       └── return_statement: conn                  [12]
+│
+├── function_definition find_user_vulnerable       [15-21]   <- chunk 2  (SQL BUG)
+├── function_definition find_user_safe             [24-28]   <- chunk 3
+├── function_definition run_backup_vulnerable      [31-35]   <- chunk 4  (CMD BUG)
+├── function_definition run_backup_safe            [38-42]   <- chunk 5
+├── function_definition read_statement             [45-48]   <- chunk 6
+├── function_definition hash_pin                   [51-53]   <- chunk 7
+│
+├── class_definition Account                       [56-71]   <- chunk 8
+│   ├── function_definition __init__               [57-59]   <- chunk 9
+│   ├── function_definition deposit                [61-65]   <- chunk 10
+│   └── function_definition withdraw               [67-71]   <- chunk 11
+│
+├── function_definition monthly_report             [74-78]   <- chunk 12
+├── function_definition ping_host_safe             [81-85]   <- chunk 13
+├── function_definition export_users_vulnerable    [88-95]   <- chunk 14
+└── function_definition greet                      [98-99]   <- chunk 15
 ```
 
-This picks which Tree-sitter **grammar** will parse the file. (Unsupported extension = file skipped + warning shown in the UI.)
+**Key idea:** an AST is not a flat list of lines, it knows *boundaries*. Line 15 is not just line 15, it is the **start of a named unit** `find_user_vulnerable` that ends at line 21. That is what makes semantic chunking possible.
 
-### Stage 3 — Tree-sitter parsing (`ingestion/tree_sitter_parser.py`)
+### Slide 5b — The two vulnerable subtrees, expanded to the last node
 
-The Python grammar builds a real syntax tree:
+These are the exact nodes the chunker, the retriever, and the validator will point at later:
 
 ```
-module                                    [lines 1-100]
-  expression_statement  (docstring)       [line 1]
-  import_statement      (import os)       [line 2]
-  import_statement      (import sqlite3)  [line 3]
-  function_definition   (get_db)                [10-12]   <- chunk!
-  function_definition   (find_user_vulnerable)  [15-21]   <- chunk!
-  function_definition   (find_user_safe)        [24-28]   <- chunk!
-  function_definition   (run_backup_vulnerable) [31-35]   <- chunk!
-  ...
-  class_definition      (Account)         [56-71]         <- chunk!
-    function_definition (__init__)        [57-59]         <- chunk!
-    function_definition (deposit)         [61-65]         <- chunk!
-    function_definition (withdraw)        [67-71]         <- chunk!
+function_definition find_user_vulnerable   [15-21]        <- CHUNK 2
+├── identifier (name): find_user_vulnerable              [15]
+├── parameters                                           [15]
+│   └── identifier: username          (the untrusted input!)
+└── block                                 [15-21]
+    ├── comment "# user input is glued..."               [16]
+    ├── expression_statement: conn = get_db()            [17]
+    ├── expression_statement: cur = conn.cursor()        [18]
+    ├── expression_statement                             [19]  *** SQL BUG ***
+    │   └── assignment: query = <string concat>
+    │       └── binary_operator "+"                      [19]
+    │           ├── string "SELECT * FROM users WHERE name = '"
+    │           ├── identifier username    (input flows here)
+    │           └── string "'"
+    ├── expression_statement: cur.execute(query)         [20]  (the sink)
+    └── return_statement: cur.fetchall()                 [21]
 ```
 
-### Stage 4 — Semantic chunking (`ingestion/semantic_chunker.py`)
+```
+function_definition run_backup_vulnerable   [31-35]       <- CHUNK 4
+├── identifier (name): run_backup_vulnerable             [31]
+├── parameters
+│   └── identifier: filename           (the untrusted input!)
+└── block                                 [31-35]
+    ├── comment "# user input goes straight..."          [32]
+    ├── expression_statement                             [33]  *** CMD BUG ***
+    │   └── assignment: cmd = <string concat>
+    │       └── binary_operator "+"
+    │           ├── string "tar czf backup.tar.gz "
+    │           └── identifier filename   (input flows here)
+    ├── expression_statement                             [34]  (the sink)
+    │   └── call: subprocess.run(cmd, shell=True)
+    │       ├── argument: cmd
+    │       └── keyword_argument: shell=True
+    └── return_statement: "done"                         [35]
+```
 
-The chunker cuts the tree at every function/class boundary. **100 lines become 15 chunks:**
+Reading the tree top-down, **the bug pattern is visible as structure**: *untrusted `identifier` -> `string concat` -> dangerous `call`*, all inside one `block`. That is exactly what the LLM is asked to find later — and exactly what the validator re-checks.
 
-| # | Chunk (symbol) | Type | Lines |
+---
+
+## Slide 6 — PHASE A, Stage 4: Chunking — where the tree gets cut (`semantic_chunker.py`)
+
+**Rule:** the chunker walks the AST and emits one `CodeUnit` per "named definition" node — `function_definition` and `class_definition` (methods inside a class are emitted both standalone and inside the class chunk). Everything else (imports, top-level assignments, comments) is never a chunk of its own; it belongs to the file, not to a unit.
+
+Cut points on our tree:
+
+| AST node cut | Chunk produced | Source lines | Code text taken from the tree |
 |---|---|---|---|
-| 1 | `get_db` | function | 10-12 |
-| 2 | `find_user_vulnerable` | function | 15-21 |
-| 3 | `find_user_safe` | function | 24-28 |
-| 4 | `run_backup_vulnerable` | function | 31-35 |
-| 5 | `run_backup_safe` | function | 38-42 |
-| 6 | `read_statement` | function | 45-48 |
-| 7 | `hash_pin` | function | 51-53 |
-| 8 | `Account` | class | 56-71 |
-| 9 | `Account.__init__` | method | 57-59 |
-| 10 | `Account.deposit` | method | 61-65 |
-| 11 | `Account.withdraw` | method | 67-71 |
-| 12 | `monthly_report` | function | 74-78 |
-| 13 | `ping_host_safe` | function | 81-85 |
-| 14 | `export_users_vulnerable` | function | 88-95 |
-| 15 | `greet` | function | 98-99 |
+| `function_definition get_db` | chunk 1 | 10-12 | `def get_db(): ...` (3 lines) |
+| `function_definition find_user_vulnerable` | chunk 2 🎯 | 15-21 | full 7 lines incl. line 19 |
+| `function_definition find_user_safe` | chunk 3 | 24-28 | 5 lines |
+| `function_definition run_backup_vulnerable` | chunk 4 🎯 | 31-35 | full 5 lines incl. 33-34 |
+| `function_definition run_backup_safe` | chunk 5 | 38-42 | 5 lines |
+| `function_definition read_statement` | chunk 6 | 45-48 | 4 lines |
+| `function_definition hash_pin` | chunk 7 | 51-53 | 3 lines |
+| `class_definition Account` | chunk 8 | 56-71 | whole class, 16 lines |
+| `function_definition __init__` | chunk 9 | 57-59 | 3 lines |
+| `function_definition deposit` | chunk 10 | 61-65 | 5 lines |
+| `function_definition withdraw` | chunk 11 | 67-71 | 5 lines |
+| `function_definition monthly_report` | chunk 12 | 74-78 | 5 lines |
+| `function_definition ping_host_safe` | chunk 13 | 81-85 | 5 lines |
+| `function_definition export_users_vulnerable` | chunk 14 | 88-95 | 8 lines |
+| `function_definition greet` | chunk 15 | 98-99 | 2 lines |
 
-**Why chunks, not raw lines?** The LLM will see *complete functions* — full context, never half a sentence. Each chunk becomes one `CodeUnit`: `{file, language, symbol, type, start_line, end_line, code, sha1 id}`.
+**100 lines -> 15 chunks -> 0 lines lost** (line ranges tile the functions; imports/assignments live at file level). Oversized units (over `MAX_CHUNK_CHARS`) are split at statement boundaries; parse failures fall back to fixed line-windows — never a silent empty index.
 
-### Stage 5 — Embedding + Vector DB (`embeddings/` then `vector_store/`)
+Each chunk becomes one immutable record (`models/schemas.py`):
 
-Each chunk is wrapped with a metadata header, then embedded:
+```json
+{
+  "id": "bank.py::find_user_vulnerable::15-21",
+  "file": "bank.py", "language": "python",
+  "symbol": "find_user_vulnerable", "unit_type": "function",
+  "start_line": 15, "end_line": 21,
+  "code": "def find_user_vulnerable(username):\n    # user input ...\n    ...",
+  "sha1": "a3f9c2..."
+}
+```
+
+---
+
+## Slide 7 — PHASE A, Stage 5: Embed + Store (`embeddings/embedder.py` → `vector_store/chroma_store.py`)
+
+Each chunk's code is wrapped with a metadata header so the vector "knows what it is" even out of context:
 
 ```
 file: bank.py
 language: python
 function: find_user_vulnerable
 def find_user_vulnerable(username):
+    # user input is glued directly into the SQL string
     query = "SELECT * FROM users WHERE name = '" + username + "'"
     ...
-        |
-        v   all-MiniLM-L6-v2 (runs LOCALLY, free)
-[0.018, -0.221, 0.442, 0.095, ... 380 more numbers ...]   <- 384-dim vector
 ```
 
-All 15 vectors stored in **ChromaDB** on disk. Indexing complete.
+That text goes through **`all-MiniLM-L6-v2`** (runs locally on CPU, free, 384-dimensional) and becomes the chunk's "meaning fingerprint":
 
-> 💰 **Cost so far: $0.00 · LLM calls: 0 · time: about 2 seconds**
+```
+[0.018, -0.221, 0.442, 0.095, ... ]   <- exactly 384 numbers
+```
+
+`indexer.py` stores all 15 into a **ChromaDB collection** on disk. Per-chunk layout:
+
+| Chroma field | Example value (chunk 2) |
+|---|---|
+| `id` | `bank.py::find_user_vulnerable::15-21` |
+| `embedding` | the 384-float vector above |
+| `document` | the header-wrapped code text (re-shown to the LLM) |
+| `metadata` | `{file, language, symbol, unit_type, start_line: 15, end_line: 21, sha1}` |
+
+`indexer.py` also returns `IndexStats`: `files_indexed=1, files_skipped=0, chunks=15, languages={python:1}` → shown in the 📊 Indexing tab.
+
+> Phase A is now finished: **$0 spent, 0 LLM calls, ~2 seconds.** The index never changes again unless you re-index.
 
 ---
 
-## Slide 3 — PHASE B, Rule 1 of 2: SQL-001 (the full journey)
+## Slide 8 — PHASE B begins, Rule 1: SQL-001 (`retrieval/retriever.py`)
 
-### Step 6 — The rule becomes a vector too (`retrieval/retriever.py`)
+### Step 6 — The rule becomes a vector (same embedder!)
 
-The rule is rendered as text and embedded with the SAME model (rule and code must live in the same meaning-space):
+The rule is rendered as text and embedded with the **same model** — rule and code must live in one shared meaning-space:
 
 ```
 Security category: SQL Injection
 Severity: HIGH
 Requirement: User-controlled input must not be concatenated directly into SQL queries.
         |
-        v   same embedder
-[0.131, 0.204, -0.087, ...]   <- the rule's barcode
+        v  all-MiniLM-L6-v2 (local, free)
+[0.131, 0.204, -0.087, ... ]   <- the rule's 384-dim fingerprint
 ```
 
-### Step 7 — Top-K retrieval from ChromaDB
+### Step 7 — Compare against all 15 chunks: cosine similarity
 
-ChromaDB compares the rule vector against all 15 chunk vectors. Top 8 returned:
+Chroma computes, for the rule vector `q` and each chunk vector `c`:
 
-| Rank | Chunk | Lines | Similarity | Contains the bug? |
+```
+             q · c            sum(qi * ci)
+cos(q, c) = -------  =  ----------------------------
+          |q| |c|        sqrt(sum(qi^2)) * sqrt(sum(ci^2))
+
+range -1..1  ->  1 = "same meaning", 0 = "unrelated"
+```
+
+All 15 scores, sorted (scores *illustrative* but realistic for MiniLM):
+
+| Rank | Chunk | Lines | Score | The bug? |
 |---|---|---|---|---|
 | 1 | `find_user_vulnerable` | 15-21 | **0.61** | 🎯 YES (line 19) |
-| 2 | `find_user_safe` | 24-28 | 0.55 | no - safe version |
+| 2 | `find_user_safe` | 24-28 | 0.55 | no - safe twin |
 | 3 | `export_users_vulnerable` | 88-95 | 0.48 | no - SQL but no user input |
-| 4 | `get_db` | 10-12 | 0.41 | no - just opens DB |
+| 4 | `get_db` | 10-12 | 0.41 | no |
 | 5 | `read_statement` | 45-48 | 0.33 | no |
-| 6 | `run_backup_vulnerable` | 31-35 | 0.31 | no (different bug!) |
+| 6 | `run_backup_vulnerable` | 31-35 | 0.31 | no (that's rule 2's bug) |
 | 7 | `hash_pin` | 51-53 | 0.27 | no |
 | 8 | `monthly_report` | 74-78 | 0.22 | no |
+| 9-15 | 7 remaining chunks | | < 0.20 | dropped (below TOP_K) |
 
-⚠️ **Key teaching point:** the buggy function AND the safe function are both retrieved. Similarity is not guilt — retrieval only says "the answer is probably in these 8." Judging comes next.
+**Top-K = 8** (`config.py`) — only these 8 travel to the LLM.
 
-### Step 8 — The ONE LLM call for this rule (`llm/prompts.py` + OpenRouter)
+⚠️ **Teaching point:** rank 1 = the bug, rank 2 = the safe twin, rank 6 = the *other* rule's bug. **Retrieval is a candidate filter, never a verdict.** Similarity says "look here", not "guilty".
 
-The actual prompt sent (abridged — real one includes all 8 full code units):
+---
+
+## Slide 9 — Step 8: The ONE LLM call for SQL-001 (`llm/prompts.py` + `llm/openrouter_client.py`)
+
+### The prompt that is actually sent (abridged — the real one embeds all 8 full code texts):
 
 ```
-SYSTEM: You are a security-analysis reasoning engine.
-STRICT RULES:
-- Analyze ONLY the supplied code. Do not invent source code.
-- Do not invent files. Do not invent line numbers. Do not invent functions.
-- Semantic similarity is NOT proof of a vulnerability.
-- Every piece of evidence MUST copy the exact file, line, and snippet.
-- Respond with STRICT JSON ONLY: {status, confidence, reason, evidence[]}
+SYSTEM (temperature 0.0, strict JSON):
+  You are a security-analysis reasoning engine.
+  STRICT RULES:
+  - Analyze ONLY the supplied code. Do not invent source code.
+  - Do not invent files, line numbers, or functions.
+  - Semantic similarity is NOT proof of a vulnerability.
+  - Every evidence item MUST copy the exact file, line, and snippet.
+  - Respond with STRICT JSON ONLY:
+    {status, confidence, reason, evidence[{file,line,function,code,reason}]}
 
-USER:  SECURITY RULE: id: SQL-001, severity: HIGH, category: SQL Injection
-       requirement: User-controlled input must not be concatenated directly
-       into SQL queries.
-       RETRIEVED CODE UNITS (8):
-       --- UNIT 1 --- file: bank.py, function: find_user_vulnerable,
-           lines: 15-21, similarity: 0.61
-           code: <full function text>
-       --- UNIT 2 --- ... (7 more)
+USER:
+  SECURITY RULE: id: SQL-001, severity: HIGH, category: SQL Injection
+  requirement: User-controlled input must not be concatenated directly
+  into SQL queries.
+
+  RETRIEVED CODE UNITS (8):
+  --- UNIT 1 --- file: bank.py | function: find_user_vulnerable
+                 lines: 15-21 | similarity: 0.61
+      def find_user_vulnerable(username):
+          # user input is glued directly into the SQL string
+          conn = get_db()
+          cur = conn.cursor()
+          query = "SELECT * FROM users WHERE name = '" + username + "'"
+          cur.execute(query)
+          return cur.fetchall()
+  --- UNIT 2 --- file: bank.py | function: find_user_safe | lines: 24-28 | 0.55
+      ... (units 3-8 likewise, full source)
 ```
 
-Typical model response (temperature 0.0, deterministic):
+### What comes back (deterministic at temp 0.0; realistic example):
 
 ```json
 {
   "status": "VULNERABLE",
   "confidence": 0.93,
-  "reason": "In find_user_vulnerable, the 'username' parameter is concatenated directly into the SQL string on line 19 and executed on line 20. The neighboring find_user_safe shows the safe parameterized form, confirming no sanitization is applied in the vulnerable variant.",
+  "reason": "find_user_vulnerable concatenates the 'username' parameter directly into the SQL string on line 19 and executes it on line 20. find_user_safe in the same file demonstrates the correct parameterized form, confirming no sanitization happens anywhere for the vulnerable variant.",
   "evidence": [
     { "file": "bank.py", "line": 19, "function": "find_user_vulnerable",
       "code": "query = \"SELECT * FROM users WHERE name = '\" + username + \"'\"",
-      "reason": "user-controlled 'username' concatenated into SQL" },
+      "reason": "user-controlled username concatenated into SQL string" },
     { "file": "bank.py", "line": 20, "function": "find_user_vulnerable",
       "code": "cur.execute(query)",
       "reason": "the tainted query is executed" }
@@ -279,134 +419,136 @@ Typical model response (temperature 0.0, deterministic):
 }
 ```
 
-Token meter: about 1,350 prompt tokens + 220 completion tokens. **This is the only paid step.**
-
-### Step 9 — Evidence validation: the LLM is NOT trusted (`analysis/evidence_validator.py`)
-
-Every evidence item is re-checked against the real `bank.py` on disk:
-
-**Evidence item 1 — `bank.py`, line 19:**
-
-| Check | Result |
-|---|---|
-| 1. File exists? | ✅ `bank.py` found in the uploaded repo |
-| 2. Line 19 in range? | ✅ file has 100 lines |
-| 3. Exact code in file? | ✅ whitespace-normalized match: `query = "SELECT * FROM users WHERE name = '" + username + "'"` is literally line 19 |
-| → Verdict | ✅ **VALID — "verified against repository"** |
-
-**Evidence item 2 — `bank.py`, line 20:** same three checks → ✅ VALID.
-
-**What if the LLM had lied?** (three failure demos)
-
-| LLM claims | Validator says | Why |
-|---|---|---|
-| `file: auth/login.py` | ❌ rejected | "file 'auth/login.py' does not exist" |
-| `line: 450` | ❌ rejected | "line 450 out of range (file has 100 lines)" |
-| `code: cursor.execute(f"...{user}...")` | ❌ rejected | "cited code not found in file (possible fabrication)" |
-
-And the final gate in `analyzer.py`: if ALL evidence had failed, the VULNERABLE verdict would be **downgraded to INCONCLUSIVE** with the annotation `[downgraded: no evidence item could be verified against the repository]`.
-
-### Step 10 — Deduplication + RuleResult (`analysis/deduplicator.py`)
-
-Findings keyed by `(rule_id, file, function, line)` — duplicates removed. Final result for rule 1:
-
-```
-RuleResult(
-  rule=SQL-001 [HIGH] SQL Injection,
-  status=VULNERABLE,  confidence=0.93,
-  evidence=[bank.py:19 ✔ verified, bank.py:20 ✔ verified],
-  retrieved=[8 units with scores]
-)
-```
+What the LLM was really doing: reading UNIT 1's AST-level pattern (identifier -> concat -> execute) and *reasoning*; reading UNIT 2 and correctly *acquitting* it (`?` placeholder = parameterized = safe). About 1,350 prompt + 220 completion tokens — the only paid step so far.
 
 ---
 
-## Slide 4 — PHASE B, Rule 2 of 2: CMD-001 (same pipeline, new rule)
+## Slide 10 — Step 9: Evidence validation — the LLM is NOT trusted (`analysis/evidence_validator.py`)
 
-Nothing is reused except the index — the rule changes, the journey repeats:
+The verdict is a *claim*. The validator turns claims into *facts* by re-reading the real `bank.py` from disk:
 
-**Retrieval** (new rule vector → different top-8):
+**Evidence 1 — `bank.py`, line 19:**
 
-| Rank | Chunk | Lines | Similarity | Contains the bug? |
-|---|---|---|---|---|
-| 1 | `run_backup_vulnerable` | 31-35 | **0.63** | 🎯 YES (lines 33-34) |
-| 2 | `run_backup_safe` | 38-42 | 0.56 | no - validates + no shell |
-| 3 | `ping_host_safe` | 81-85 | 0.49 | no - allow-list |
-| 4 | `find_user_vulnerable` | 15-21 | 0.28 | no |
-| ... | (4 more) | | < 0.25 | no |
+| # | Check (implemented) | Result |
+|---|---|---|
+| 1 | File exists? (`repo / cited_path`) | ✅ `bank.py` found |
+| 2 | Line in range? (1 <= 19 <= total lines) | ✅ file has 100 lines |
+| 3 | Cited code literally in that line? (whitespace-normalized `in` comparison) | ✅ matches line 19 exactly |
+| → | **VALID — "verified against repository"** | ✅ |
 
-**LLM verdict:**
+**Evidence 2 — `bank.py`, line 20:** all three checks → ✅ VALID.
 
+### What happens when the model fabricates (the whole point of the project):
+
+| LLM claims | Validator | Reason recorded |
+|---|---|---|
+| `file: auth/login.py` | ❌ REJECTED | "file does not exist in repository" |
+| `line: 450` | ❌ REJECTED | "line 450 out of range (file has 100 lines)" |
+| `code: cursor.execute(f"...{user}...")` | ❌ REJECTED | "cited code not found at that line (possible hallucination)" |
+
+**Auto-downgrade gate** (`analysis/analyzer.py`): if a verdict is VULNERABLE but **zero** evidence items survive → status forced to **INCONCLUSIVE** with `[downgraded: no evidence item could be verified against the repository]`. A fabricated bug can never reach the report.
+
+---
+
+## Slide 11 — Step 10: Dedup + RuleResult, then Rule 2 repeats (steps 6-10)
+
+`analysis/deduplicator.py` keys every finding on `(rule_id, file, function, line)` and drops repeats (e.g. if the class chunk and the method chunk cite the same line).
+
+**Rule 1 result:**
+```
+RuleResult(SQL-001 [HIGH] SQL Injection, VULNERABLE, confidence 0.93,
+  evidence: bank.py:19 VALID, bank.py:20 VALID,
+  retrieved: 8 units with scores)
+```
+
+**Rule 2 (CMD-001) — same machine, new query:**
+- Step 6: embed CMD-001 rule → new 384-dim vector
+- Step 7: cosine vs the same 15 chunks → top-8: `run_backup_vulnerable` **0.63** 🎯, `run_backup_safe` 0.56, `ping_host_safe` 0.49, ...
+- Step 8: one LLM call →
 ```json
 { "status": "VULNERABLE", "confidence": 0.95,
-  "reason": "run_backup_vulnerable concatenates 'filename' into a shell command and runs it with shell=True (lines 33-34). An attacker passing 'x; rm -rf /' would execute arbitrary commands.",
   "evidence": [
     { "file": "bank.py", "line": 33, "function": "run_backup_vulnerable",
       "code": "cmd = \"tar czf backup.tar.gz \" + filename",
       "reason": "user input concatenated into shell command" },
     { "file": "bank.py", "line": 34, "function": "run_backup_vulnerable",
       "code": "subprocess.run(cmd, shell=True)",
-      "reason": "command executed with shell=True" } ] }
+      "reason": "executed with shell=True enables command chaining" } ] }
+```
+- Step 9: line 33 ✅ / line 34 ✅ → both VALID · Step 10: no dups →
+```
+RuleResult(CMD-001 [CRITICAL] Command Injection, VULNERABLE, confidence 0.95,
+  evidence: bank.py:33 VALID, bank.py:34 VALID)
 ```
 
-**Validation:** line 33 ✅ in file, in range, code matches · line 34 ✅ · → both VALID.
-**Dedup:** no duplicates. → `RuleResult(CMD-001, VULNERABLE, 0.95, 2 verified evidence items)`.
+**2 rules = exactly 2 LLM calls.** A 500-rule run is 500 calls — the bill is countable before you start.
 
 ---
 
-## Slide 5 — The Final Report (what the UI shows)
+## Slide 12 — The Final Report (`app.py` renders `AnalysisResult`)
 
 ```
-🔍 AI Security RAG Analyzer — Report
+🔍 AI Security RAG Analyzer — Verified Report
 
-🔴 SQL-001 [HIGH]     SQL Injection      →  VULNERABLE (confidence 0.93)
-   Evidence: bank.py:19 ✔ verified against repository
-             bank.py:20 ✔ verified against repository
+🔴 SQL-001 [HIGH]     SQL Injection      → VULNERABLE (confidence 0.93)
+   bank.py:19  find_user_vulnerable  ✔ verified against repository
+   bank.py:20  find_user_vulnerable  ✔ verified against repository
 
-🔴 CMD-001 [CRITICAL] Command Injection  →  VULNERABLE (confidence 0.95)
-   Evidence: bank.py:33 ✔ verified against repository
-             bank.py:34 ✔ verified against repository
+🔴 CMD-001 [CRITICAL] Command Injection  → VULNERABLE (confidence 0.95)
+   bank.py:33  run_backup_vulnerable ✔ verified against repository
+   bank.py:34  run_backup_vulnerable ✔ verified against repository
 
-📊 Metrics: 2 rules · 2 retrievals · 2 LLM calls
-            ~2,700 prompt tokens · ~440 completion tokens · ~11 seconds
+📊 1 file · 15 chunks · 2 rules · 2 retrievals · 2 LLM calls
+   ~2,700 prompt / ~440 completion tokens · ~11 seconds
 ```
 
-Matches ground truth exactly: **2/2 bugs found, 0 false alarms, every citation verified.**
+**Result vs ground truth: 2/2 bugs found · 0 false positives · 4/4 citations verified.**
 
 ---
 
-## Slide 6 — The Whole Journey on One Slide
+## Slide 13 — The Whole Journey on One Slide
 
 ```
- bank.py (100 lines)          rules.json (2 rules)
-        |                           |
-        v                           |
- [1] discover files                 |
- [2] detect language (.py)          |
- [3] Tree-sitter parse              |
- [4] 15 semantic chunks             |
- [5] embed locally -> ChromaDB      |
-        |                           |
-        |      FOR EACH RULE:       v
-        |        [6] embed rule text
-        |        [7] top-8 retrieval (candidates only!)
-        |        [8] ONE LLM call (strict JSON contract)
-        |        [9] validate every citation vs real file
-        |            file exists? line in range? code exact?
-        |       [10] dedupe + downgrade VULNERABLE if unproven
-        v                           v
-            VERIFIED REPORT (with metrics)
+ PHASE A — ONCE, LOCAL, $0                    PHASE B — PER RULE, PAID
+ ─────────────────────────                    ─────────────────────────
+ bank.py (100 lines)                          rules.json (2 rules)
+      │                                            │
+ [1] file_discovery: find bank.py                  │
+ [2] language_detector: ".py" → python             │
+ [3] tree_sitter_parser: AST [1-100]               │
+       └── function/class nodes = boundaries       │
+ [4] semantic_chunker: 15 CodeUnits                │
+       └── find_user_vulnerable [15-21]            │
+       └── run_backup_vulnerable [31-35]           │
+ [5] embedder: 384-dim each ──> chroma_store       │
+       (Chroma collection on disk)                 │
+             │                                     │
+             │         FOR EACH RULE (SQL-001, CMD-001):
+             │         [6] retriever: embed rule ──┘
+             │         [7] cosine vs 15 chunks → TOP-8 (candidates!)
+             │         [8] prompts.py builds 1 call → openrouter_client
+             │              → strict JSON {status, confidence, evidence}
+             │         [9] evidence_validator vs real file:
+             │              file exists? line in range? code exact?
+             │              zero valid evidence ⇒ INCONCLUSIVE
+             │        [10] deduplicator → RuleResult
+             ▼                                     ▼
+                    📄 VERIFIED REPORT (Slide 12)
 ```
 
-## Slide 7 — Why the Audience Should Care (takeaways)
+## Slide 14 — Why This Matters (5 takeaways)
 
-1. **The LLM never saw all 100 lines at once** — it judged only 8 focused chunks per rule. At 100,000 lines it would still see just 8 per rule. Cost is flat.
-2. **2 rules = exactly 2 LLM calls.** Predictable bill, no agent loops.
-3. **Every 🔴 has receipts.** Each claim survived a disk-level fact check; a fabricated file, line, or snippet would have been rejected, and an unproven VULNERABLE auto-downgrades to INCONCLUSIVE.
-4. **Safe code was retrieved too — and correctly acquitted.** `find_user_safe` and `run_backup_safe` appear in the top-8 for both rules, and the LLM cleared them. That is why there are zero false positives.
-5. **Everything else is free and local.** Embeddings, vector search, validation, dedup — $0. Only the judging step calls the paid API.
+1. **The LLM never sees "the whole codebase" — and never needs to.** It judges 8 focused functions per rule. 100 lines or 100,000 lines: still 8. Cost and latency are flat.
+2. **The AST does the heavy lifting, for free.** Tree-sitter knows that line 15–21 is one named unit — so chunks are real functions, not arbitrary line slices, which is why the verdict can cite meaningful `function:` names.
+3. **1 rule = exactly 1 LLM call.** Retrieval, embedding, validation, dedup are all local and cost $0. A 500-rule audit = 500 calls — predictable by construction.
+4. **Every 🔴 survives a disk-level fact check.** Fabricated file/line/code is rejected; an unproven VULNERABLE auto-downgrades to INCONCLUSIVE. No hallucinated finding can ship.
+5. **Safe twins were retrieved and acquitted.** `find_user_safe` and `run_backup_safe` ranked #2 for their rules — and the model correctly cleared them. Zero false positives is a feature, not luck.
 
-> One-liner for Q&A: **"Embeddings decide where to look, the LLM decides what it means, and the validator decides what we're allowed to claim."**
+> **Q&A one-liner:** *"Embeddings decide where to look, the LLM decides what it means, and the validator decides what we're allowed to claim."*
+
+---
+*Module names in this deck match the actual project (`ingestion/`, `embeddings/`, `vector_store/`, `retrieval/`, `llm/`, `analysis/`). Similarity scores and token counts are realistic illustrative values; structure, order, and file/line references are exact.*
+
 
 
 
