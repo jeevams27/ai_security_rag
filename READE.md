@@ -71,3 +71,49 @@ to spot vulnerable code.
 
 The **CVE database** stores reverse-engineered data from past hacks, which
 helps tools meet **HIPAA** and **OWASP** standards compliance.
+
+## Open Source Models
+
+- Gemma 4
+- DeepSeek V4 Pro
+- GLM-5.3
+- GPT OSS 120B
+- Kimi K2.7 Code
+- Kimi K3
+- MiniMax M3
+- Nemotron 3 Ultra
+- Qwen 3.6
+
+## Model Platforms / Gateways
+
+- OpenRouter
+- DigitalOcean
+- NanoGPT
+- LiteLLM
+- Vercel AI Gateway
+- Portkey
+- Cloudflare AI Gateway
+- TrueFoundry
+- Together AI
+- Replicate
+
+## How an LLM Works — 6 Steps
+
+**Text → Tokenization → Embedding → Transformer → Probabilities → Next Token**
+
+1. **Tokenization** — Text is split into tokens and converted into token IDs.
+   - Algorithm: BPE / SentencePiece
+2. **Embedding** — Token IDs are converted into numerical vectors using an embedding matrix.
+   - Algorithm: Embedding lookup
+3. **Transformer** — The model understands relationships between tokens using self-attention.
+   - Algorithm: `Attention(Q,K,V) = Softmax(QKᵀ / √dₖ)V`
+4. **Prediction** — The Transformer produces a score (logit) for every possible next token.
+   - Algorithm: Matrix multiplication
+5. **Probability** — Logits are converted into probabilities.
+   - Algorithm: Softmax
+6. **Next Token** — A token is selected and added to the sequence; the process repeats.
+   - Algorithm: Greedy / Sampling / Top-K / Top-P decoding
+
+## Inference 
+## Parameters
+
