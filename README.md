@@ -98,9 +98,7 @@ load manifest          discover files
                              │
                              ▼
                           IndexStats
-                             │
-                             ▼
-                            app.py
+                            
 ```
 
 The manifest (content-hash cache) is what makes re-indexing incremental:
