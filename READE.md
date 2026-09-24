@@ -68,3 +68,6 @@ Vulnerabilities are **digital fingerprints left behind by thousands of past
 security issues**. Security researchers mapped them out over the years, and
 these fingerprints are what automated tools, SAST scanners, and AI models use
 to spot vulnerable code.
+
+The **CVE database** stores reverse-engineered data from past hacks, which
+helps tools meet **HIPAA** and **OWASP** standards compliance.
