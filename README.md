@@ -6,71 +6,145 @@ relevant to each rule and uses an LLM to decide whether that code violates
 the rule — with every cited line of evidence verified against the real
 repository.
 
-## Architecture
+## Architecture - step by step
 
-One pipeline, two phases. Index once per repository, then analyze any number of security rules:
+The system works in two phases:
 
-```text
-                    .- PHASE 1: INDEX (once) ----------------.
-                    | repo files -> parse -> embed -> Chroma |
-                    `---------------------+------------------'
-                                          |
-                                          v
-User --> app.py (Streamlit) --> .- PHASE 2: ANALYZE (per rule) -------------.
-   ^                            | rule -> retrieve Top-K -> LLM -> validate |
-   |                            `---------------------+----------------------'
-   `---------------- findings + JSON report ---------'
-```
-
-Responsibilities are strictly separated:
-
-| Component | Question it answers |
-|---|---|
-| Tree-sitter | What are the meaningful pieces of code? |
-| Vector search | Which pieces appear relevant to this security requirement? |
-| LLM | Does the retrieved code actually violate the requirement? |
-| Evidence validator | Did the LLM evidence actually exist in the repository? |
-
-### Phase 1 - Index (Build Index button -> app.py -> ingestion/)
+- Phase 1 (INDEX) runs once per repository.
+- Phase 2 (ANALYZE) runs once per security rule.
 
 ```text
-repo_dir --> index_repository() --> load manifest (cache) + discover files
-                                                        |
-                        per file: detect language --> hash content
-                                                        |
-                          .---------------+------------.
-                          v                            v
-                     unchanged                    changed / new
-                  reuse old units         SemanticChunker -> Tree-sitter ->
-                                          CodeUnits -> Embeddings -> ChromaDB
-                          `---------------+------------'
-                                          v
-              remove deleted files --> save manifest --> IndexStats
+Step 1. User opens app.py (Streamlit UI)
+   |
+   v
+Step 2. PHASE 1 - INDEX the repository
+   |
+   v
+Step 3. PHASE 2 - ANALYZE the index against security rules
+   |
+   v
+Step 4. User reads the findings + downloads the JSON report
 ```
 
-The content-hash manifest is what makes re-indexing incremental:
-unchanged files skip parsing, embedding and ChromaDB writes entirely.
+### PHASE 1 - INDEX (Build Index button -> ingestion/)
 
-### Phase 2 - Analyze (Analyze Security button -> analysis/ + llm/)
+This phase converts raw source files into searchable vectors.
+It runs once, and re-runs incrementally when files change.
 
 ```text
-per rule: embed requirement --> Top-K retrieval from ChromaDB
-                                                        |
-                                                        v
-                         LLM judges candidates (strict JSON verdict)
-                                                        |
-                                                        v
-                    validate evidence on disk --> drop unverified --> dedupe
-                                                        |
-                                                        v
-                             report: VULNERABLE-only findings
-                      (why + file/line/function/code + fix guidance)
+Step 1. User picks a repository folder
+   |
+   v
+Step 2. app.py passes repo_dir to index_repository(repo_dir)
+   |
+   v
+Step 3. Load the manifest (cache of last index)
+   |
+   v
+Step 4. Discover all source files in the folder
+   |
+   v
+Step 5. For each file, detect its language
+   |
+   v
+Step 6. Hash the file content
+   |
+   v
+Step 7. Compare hash with manifest
+   |
+   +-----> UNCHANGED -> reuse old code units -> skip to next file
+   |
+   +-----> CHANGED or NEW -> continue to Step 8
+   |
+   v
+Step 8. SemanticChunker splits the file
+   |
+   v
+Step 9. Tree-sitter parses each chunk
+   |
+   v
+Step 10. Build CodeUnits (functions, methods, classes)
+   |
+   v
+Step 11. Embed each CodeUnit into a vector
+   |
+   v
+Step 12. Store vectors in ChromaDB
+   |
+   v
+Step 13. Update the manifest with the new hash
+   |
+   v
+Step 14. Move to next file (repeat Step 5 to Step 13)
+   |
+   v
+Step 15. Remove deleted files from ChromaDB
+   |
+   v
+Step 16. Save manifest to disk
+   |
+   v
+Step 17. Return IndexStats to app.py
+        (files, lines, languages, units, embeddings, records)
 ```
 
-Vector search is candidate generation, not proof: the LLM makes the
-security judgment, and only evidence verified against the real repository
-reaches the report.
+Why the manifest matters: unchanged files are never re-parsed,
+re-embedded, or re-stored. That is what keeps re-indexing fast.
 
+### PHASE 2 - ANALYZE (Analyze Security button -> analysis/ + llm/)
+
+This phase runs once per rule, using only the index built in Phase 1.
+
+```text
+Step 1. Load security_rules.json (1, 5, 50 or 100 rules - same code path)
+   |
+   v
+Step 2. Pick one rule
+   |
+   v
+Step 3. Embed the rule requirement into the same vector space as the code
+   |
+   v
+Step 4. Retrieve Top-K relevant CodeUnits from ChromaDB
+        (default K = 8, semantic candidate generation only)
+   |
+   v
+Step 5. Send rule + retrieved code to the LLM (OpenRouter, strict JSON)
+   |
+   v
+Step 6. LLM returns one verdict per rule:
+        VULNERABLE or SAFE or INCONCLUSIVE, with confidence,
+        reason, and cited evidence (file, line, function, code)
+   |
+   v
+Step 7. Evidence validator checks every cited item on disk:
+        - does the file exist in the repository?
+        - is the line number real?
+        - does the quoted code actually appear near that line?
+        - does the named function exist?
+        Unverified items are dropped.
+   |
+   v
+Step 8. If verdict is VULNERABLE but no evidence survived,
+        downgrade verdict to INCONCLUSIVE
+   |
+   v
+Step 9. Deduplicate repeated evidence
+   |
+   v
+Step 10. Repeat Step 2 to Step 9 for the next rule
+   |
+   v
+Step 11. Build the final report
+        - screen shows VULNERABLE findings only, fully open:
+          why it is vulnerable + file/line/function/code table
+          + what NOT to do + what to do instead
+        - JSON download keeps everything (all verdicts, retrieved units,
+          evidence, token usage, runtime)
+```
+
+Key idea: vector search only proposes candidates, the LLM judges them,
+and the validator confirms the cited code really exists before it is shown.
 ## Why not send the whole repository to the LLM?
 
 A 100K-line repository does not fit (economically or technically) into a
@@ -118,5 +192,3 @@ grammars. To add a language: add its extension to
 `ingestion/language_detector.py` and an adapter to
 `ingestion/tree_sitter_parser.py` (`LANGUAGE_SPECS`).
 
-ps, consider
-   batching/async LLM calls and a cross-encoder reranker.
