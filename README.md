@@ -8,18 +8,18 @@ repository.
 
 ## Architecture
 
-```
-Source Code
-   ↓  Tree-sitter parsing (language adapters)
-Semantic Code Units (functions / methods / classes / ...)
-   ↓  Code Embeddings (pluggable EmbeddingModel)
-Vector Database (local ChromaDB)          ← indexed ONCE per repository
-   ↓  Security Rule Embedding (same embedding space)
-Semantic Retrieval (Top-K relevant units) ← per rule, candidate generation
-   ↓
-LLM Reasoning (OpenRouter)                ← security judgment, strict JSON
-   ↓
-Security Verdict + Grounded Evidence      ← evidence re-verified on disk
+One pipeline, two phases. Index once per repository, then analyze any number of security rules:
+
+```text
+                    .- PHASE 1: INDEX (once) ----------------.
+                    | repo files -> parse -> embed -> Chroma |
+                    `---------------------+------------------'
+                                          |
+                                          v
+User --> app.py (Streamlit) --> .- PHASE 2: ANALYZE (per rule) -------------.
+   ^                            | rule -> retrieve Top-K -> LLM -> validate |
+   |                            `---------------------+----------------------'
+   `---------------- findings + JSON report ---------'
 ```
 
 Responsibilities are strictly separated:
@@ -29,80 +29,47 @@ Responsibilities are strictly separated:
 | Tree-sitter | What are the meaningful pieces of code? |
 | Vector search | Which pieces appear relevant to this security requirement? |
 | LLM | Does the retrieved code actually violate the requirement? |
-| Evidence validator | Did the LLM's evidence actually exist in the repository? |
+| Evidence validator | Did the LLM evidence actually exist in the repository? |
 
-## Indexer flow (Build Index button → `app.py` → `ingestion/`)
+### Phase 1 - Index (Build Index button -> app.py -> ingestion/)
 
-```
-USER REPOSITORY
-       │
-       ▼
-repo_dir from app.py
-       │
-       ▼
-index_repository(repo_dir)
-       │
-       ▼
-      root
-       │
-       ├──────────────────────┐
-       │                      │
-       ▼                      ▼
-load manifest          discover files
-(old cache)                  │
-                             ▼
-                            path
-                             │
-                             ▼
-                   detect_language(path)
-                             │
-                             ▼
-                          language
-                             │
-                             ▼
-                     hash file content
-                             │
-              ┌──────────────┴──────────────┐
-              │                             │
-         unchanged                     changed/new
-              │                             │
-              ▼                             ▼
-       reuse old units              SemanticChunker
-              │                             │
-              │                             ▼
-              │                        Tree-sitter
-              │                             │
-              │                             ▼
-              │                          CodeUnits
-              │                             │
-              │                             ▼
-              │                         Embeddings
-              │                             │
-              │                             ▼
-              │                          ChromaDB
-              │                             │
-              │                             ▼
-              │                      update manifest
-              └──────────────┬──────────────┘
-                             ▼
-                          next file
-                             │
-                             ▼
-                       all files done
-                             │
-                             ▼
-                    remove deleted files
-                             │
-                             ▼
-                        save manifest
-                             │
-                             ▼
-                          IndexStats
-                            
+```text
+repo_dir --> index_repository() --> load manifest (cache) + discover files
+                                                        |
+                        per file: detect language --> hash content
+                                                        |
+                          .---------------+------------.
+                          v                            v
+                     unchanged                    changed / new
+                  reuse old units         SemanticChunker -> Tree-sitter ->
+                                          CodeUnits -> Embeddings -> ChromaDB
+                          `---------------+------------'
+                                          v
+              remove deleted files --> save manifest --> IndexStats
 ```
 
-The manifest (content-hash cache) is what makes re-indexing incremental:
-unchanged files skip Tree-sitter, embedding and ChromaDB writes entirely.
+The content-hash manifest is what makes re-indexing incremental:
+unchanged files skip parsing, embedding and ChromaDB writes entirely.
+
+### Phase 2 - Analyze (Analyze Security button -> analysis/ + llm/)
+
+```text
+per rule: embed requirement --> Top-K retrieval from ChromaDB
+                                                        |
+                                                        v
+                         LLM judges candidates (strict JSON verdict)
+                                                        |
+                                                        v
+                    validate evidence on disk --> drop unverified --> dedupe
+                                                        |
+                                                        v
+                             report: VULNERABLE-only findings
+                      (why + file/line/function/code + fix guidance)
+```
+
+Vector search is candidate generation, not proof: the LLM makes the
+security judgment, and only evidence verified against the real repository
+reaches the report.
 
 ## Why not send the whole repository to the LLM?
 
@@ -151,29 +118,5 @@ grammars. To add a language: add its extension to
 `ingestion/language_detector.py` and an adapter to
 `ingestion/tree_sitter_parser.py` (`LANGUAGE_SPECS`).
 
-## Installation
-
-```bash
-pip install -r requirements.txt
-cp .env.example .env   # then fill in your key
-```
-
-## Configuration (environment variables)
-
-| Variable | Purpose |
-|---|---|
-| `OPENROUTER_API_KEY` | OpenRouter API key (required for analysis) |
-| `OPENROUTER_MODEL` | e.g. `openai/gpt-4o-mini` — any OpenRouter model |
-| `EMBEDDING_BACKEND` | `sentence_transformers` (default, local model) or `hashing` (offline baseline) |
-| `EMBEDDING_MODEL` | e.g. `all-MiniLM-L6-v2` |
-| `TOP_K` | retrieved units per rule (default 8) |
-| `CHROMA_DIR` / `COLLECTION_NAME` | vector DB location |
-
-
-
-The UI flow: upload/select a repository and a `security_rules.json` →
-**Build Index** (files, lines, languages, code units, embeddings, vector
-records) → **Analyze Security** (per-rule retrieved units with similarity
-scores, status, confidence, reason, validated evidence, and token/runtime
-metrics).
-
+ps, consider
+   batching/async LLM calls and a cross-encoder reranker.
