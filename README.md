@@ -1,243 +1,420 @@
-# AI Security RAG Analyzer
+﻿# Application Security Testing — Notes
 
-A language-agnostic, retrieval-augmented security analyzer. Given a source
-repository and any number of structured security rules, it finds the code
-relevant to each rule and uses an LLM to decide whether that code violates
-the rule — with every cited line of evidence verified against the real
-repository.
+Study notes on application security testing approaches (SAST/DAST), the SAST
+tool landscape, and how detection engines work under the hood — from rule-based
+patterns to AI-native models.
 
-## Architecture - step by step
+## SAST vs DAST
 
-The system works in two phases:
+- **SAST** — Static Application Security Testing: analyzes the **source code**
+  without running the application.
+- **DAST** — Dynamic Application Security Testing: tests **while the
+  application is running**.
 
-- Phase 1 (INDEX) runs once per repository.
-- Phase 2 (ANALYZE) runs once per security rule.
+Both are critical approaches to application security testing.
+
+**Shared disadvantage:** false positives — the scanner flags safe code as
+vulnerable.
+
+## SAST Tool Comparison
+
+| # | Tool | Approach | Languages |
+|---|------|----------|-----------|
+| 1 | CodeAnt AI | AI-native | 30+ |
+| 2 | Snyk Code | AI-assisted | 20+ |
+| 3 | Checkmarx One | AI-assisted | 30+ |
+| 4 | SonarQube | Rule-based | 30+ |
+| 5 | Semgrep | AI-assisted | 30+ |
+| 6 | Veracode | AI-assisted | 100+ |
+
+> Semgrep is itself a SAST tool — it analyzes source code statically.
+
+## Detection Models
+
+### 1. Rule-Based Model (Checkmarx / SonarQube)
+
+**How it works:** AST + data-flow graph patterns.
+
+**Basic logic:** a hardcoded pattern (e.g. eval($input)) triggers an alert.
+
+**Problem:** creates a high number of false positives — it flags safe code.
+
+### 2. AI-Assisted (SonarQube AI CodeFix, Checkmarx with AI mapping)
+
+- A **rule-based engine is the primary brain**.
+- An **LLM helps to fix the error** (suggested remediation).
+
+### 3. AI-Native Model (CodeRabbit, GraphXio)
+
+**How it works:** tree-sitter structural parsing + a smart AST-based chunking
+and retrieval pipeline (RAG).
+
+It does **not** dump 100,000 lines into the model (like an open-net filter
+dumping every vulnerability across files, workflows, OWASP, HIPAA, and general
+best practices). Instead, it works with constraints on what to look for.
+
+#### How the AST chunking pipeline works
+
+1. **AST chunks** — uses source-code parsers (like **tree-sitter**) to break
+   code down into an Abstract Syntax Tree.
+2. **Logical grouping** — instead of cutting files into arbitrary text lines,
+   it groups code logically by **functions, classes, and blocks**.
+3. **Vector storage** — converts the chunks into **vector embeddings** and
+   stores them in a **vector database** for retrieval.
+
+## Vulnerability Fingerprints
+
+Vulnerabilities are **digital fingerprints left behind by thousands of past
+security issues**. Security researchers mapped them out over the years, and
+these fingerprints are what automated tools, SAST scanners, and AI models use
+to spot vulnerable code.
+
+The **CVE database** stores reverse-engineered data from past hacks, which
+helps tools meet **HIPAA** and **OWASP** standards compliance.
+
+## Open Source Models
+
+- Gemma 4
+- DeepSeek V4 Pro
+- GLM-5.3
+- GPT OSS 120B
+- Kimi K2.7 Code
+- Kimi K3
+- MiniMax M3
+- Nemotron 3 Ultra
+- Qwen 3.6
+
+## Model Platforms / Gateways
+
+- OpenRouter
+- DigitalOcean
+- NanoGPT
+- LiteLLM
+- Vercel AI Gateway
+- Portkey
+- Cloudflare AI Gateway
+- TrueFoundry
+- Together AI
+- Replicate
+
+## How an LLM Works — 6 Steps
+
+**Text → Tokenization → Embedding → Transformer → Probabilities → Next Token**
+
+1. **Tokenization** — Text is split into tokens and converted into token IDs.
+   - Algorithm: BPE / SentencePiece
+2. **Embedding** — Token IDs are converted into numerical vectors using an embedding matrix.
+   - Algorithm: Embedding lookup
+3. **Transformer** — The model understands relationships between tokens using self-attention.
+   - Algorithm: `Attention(Q,K,V) = Softmax(QKᵀ / √dₖ)V`
+4. **Prediction** — The Transformer produces a score (logit) for every possible next token.
+   - Algorithm: Matrix multiplication
+5. **Probability** — Logits are converted into probabilities.
+   - Algorithm: Softmax
+6. **Next Token** — A token is selected and added to the sequence; the process repeats.
+   - Algorithm: Greedy / Sampling / Top-K / Top-P decoding
+
+## Inference Parameters
+
+
+## Vulnerable Flask App — AST Walkthrough
+
+Sample Flask app with three classic vulnerabilities — **SQL injection** (`get_user`),
+**command injection** (`ping_host`), and **SSTI** (`/hello`) — followed by its
+abstract syntax tree, since AST-based SAST tools scan the tree rather than raw text.
+
+```python
+from flask import Flask, request, render_template_string
+import sqlite3
+import subprocess
+
+app = Flask(__name__)
+
+DATABASE = "users.db"
+
+
+def get_db():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def get_user(username):
+    db = get_db()
+
+    # VULNERABILITY 1: SQL Injection
+    query = "SELECT * FROM users WHERE username = '" + username + "'"
+
+    result = db.execute(query)
+    user = result.fetchone()
+
+    db.close()
+    return user
+
+
+def ping_host(host):
+    # VULNERABILITY 2: Command Injection
+    command = "ping -c 1 " + host
+    result = subprocess.check_output(
+        command,
+        shell=True,
+        text=True
+    )
+    return result
+
+
+@app.route("/user")
+def user():
+    username = request.args.get("username", "")
+
+    user_data = get_user(username)
+
+    if user_data:
+        return {
+            "username": user_data["username"],
+            "email": user_data["email"]
+        }
+
+    return {"error": "User not found"}, 404
+
+
+@app.route("/ping")
+def ping():
+    host = request.args.get("host", "")
+
+    result = ping_host(host)
+
+    return {
+        "host": host,
+        "result": result
+    }
+
+
+@app.route("/hello")
+def hello():
+    name = request.args.get("name", "Guest")
+
+    return render_template_string(
+        "<h1>Hello " + name + "</h1>"
+    )
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
+```
+
+### AST Tree — node / child marked
+
+Legend: `[NODE]` = has children (branch) · `[CHILD]` = terminal leaf (no children)
 
 ```text
-Step 1. User opens app.py (Streamlit UI)
-   |
-   v
-Step 2. PHASE 1 - INDEX the repository
-   |
-   v
-Step 3. PHASE 2 - ANALYZE the index against security rules
-   |
-   v
-Step 4. User reads the findings + downloads the JSON report
+ast tree  module                                 [NODE - root]
+│
+├── import_statement                             [NODE]
+│   ├── from: flask                              [CHILD]
+│   └── imports:                                 [NODE]
+│       ├── Flask                                [CHILD]
+│       ├── request                              [CHILD]
+│       └── render_template_string               [CHILD]
+│
+├── import_statement                             [NODE]
+│   └── sqlite3                                  [CHILD]
+│
+├── import_statement                             [NODE]
+│   └── subprocess                               [CHILD]
+│
+├── assignment                                   [NODE]
+│   ├── name: app                                [CHILD]
+│   └── call                                     [NODE]
+│       ├── function: Flask                      [CHILD]
+│       └── argument: "__name__"                 [CHILD]
+│
+├── assignment                                   [NODE]
+│   ├── name: DATABASE                           [CHILD]
+│   └── string: "users.db"                       [CHILD]
+│
+├── function_definition                          [NODE]
+│   ├── name: get_db                             [CHILD]
+│   │
+│   └── body                                     [NODE]
+│       │
+│       ├── assignment                           [NODE]
+│       │   ├── name: conn                       [CHILD]
+│       │   └── call                             [NODE]
+│       │       ├── object: sqlite3              [CHILD]
+│       │       └── function: connect            [CHILD]
+│       │       └── argument: DATABASE           [CHILD]
+│       │
+│       ├── expression_statement                 [NODE]
+│       │   └── call                             [NODE]
+│       │       ├── object: conn                 [CHILD]
+│       │       └── function: row_factory        [CHILD]
+│       │
+│       └── return_statement                     [NODE]
+│           └── identifier: conn                 [CHILD]
+│
+├── function_definition                          [NODE]
+│   ├── name: get_user                           [CHILD]
+│   ├── parameter                                [NODE]
+│   │   └── username                             [CHILD]
+│   │
+│   └── body                                     [NODE]
+│       │
+│       ├── assignment                           [NODE]
+│       │   ├── name: db                         [CHILD]
+│       │   └── call                             [NODE]
+│       │       └── get_db()                     [CHILD]
+│       │
+│       ├── assignment                           [NODE]
+│       │   ├── name: query                      [CHILD]
+│       │   │
+│       │   └── binary_operator                  [NODE]
+│       │       ├── string                       [NODE]
+│       │       │   "SELECT * FROM users WHERE username = '"   [CHILD]
+│       │       ├── operator: +                  [CHILD]
+│       │       ├── identifier: username         [CHILD]
+│       │       ├── operator: +                  [CHILD]
+│       │       └── string: "'"                  [CHILD]
+│       │
+│       ├── assignment                           [NODE]
+│       │   ├── name: result                     [CHILD]
+│       │   └── call                             [NODE]
+│       │       ├── object: db                   [CHILD]
+│       │       ├── function: execute            [CHILD]
+│       │       └── argument: query              [CHILD]
+│       │
+│       ├── assignment                           [NODE]
+│       │   ├── name: user                       [CHILD]
+│       │   └── call                             [NODE]
+│       │       ├── object: result               [CHILD]
+│       │       └── function: fetchone           [CHILD]
+│       │
+│       ├── expression_statement                 [NODE]
+│       │   └── call                             [NODE]
+│       │       └── db.close()                   [CHILD]
+│       │
+│       └── return_statement                     [NODE]
+│           └── identifier: user                 [CHILD]
+│
+├── function_definition                          [NODE]
+│   ├── name: ping_host                          [CHILD]
+│   ├── parameter                                [NODE]
+│   │   └── host                                 [CHILD]
+│   │
+│   └── body                                     [NODE]
+│       │
+│       ├── assignment                           [NODE]
+│       │   ├── name: command                    [CHILD]
+│       │   └── binary_operator                  [NODE]
+│       │       ├── string: "ping -c 1 "         [CHILD]
+│       │       ├── operator: +                  [CHILD]
+│       │       └── identifier: host             [CHILD]
+│       │
+│       ├── assignment                           [NODE]
+│       │   ├── name: result                     [CHILD]
+│       │   └── call                             [NODE]
+│       │       ├── function: subprocess.check_output   [CHILD]
+│       │       ├── argument: command            [CHILD]
+│       │       ├── argument: shell=True         [CHILD]
+│       │       └── argument: text=True          [CHILD]
+│       │
+│       └── return_statement                     [NODE]
+│           └── identifier: result               [CHILD]
+│
+├── decorated_definition                         [NODE]
+│   │
+│   ├── decorator                                [NODE]
+│   │   └── @app.route("/user")                  [CHILD]
+│   │
+│   └── function_definition                      [NODE]
+│       ├── name: user                           [CHILD]
+│       │
+│       └── body                                 [NODE]
+│           │
+│           ├── assignment                       [NODE]
+│           │   ├── name: username               [CHILD]
+│           │   └── call                         [NODE]
+│           │       ├── request.args.get         [CHILD]
+│           │       └── arguments:               [NODE]
+│           │           ├── "username"           [CHILD]
+│           │           └── ""                   [CHILD]
+│           │
+│           ├── assignment                       [NODE]
+│           │   ├── name: user_data              [CHILD]
+│           │   └── call                         [NODE]
+│           │       └── get_user(username)       [CHILD]
+│           │
+│           ├── if_statement                     [NODE]
+│           │   ├── condition: user_data         [CHILD]
+│           │   │
+│           │   └── consequence                  [NODE]
+│           │       └── return_statement         [NODE]
+│           │           └── dictionary           [NODE]
+│           │               ├── username → user_data["username"]   [CHILD]
+│           │               └── email → user_data["email"]         [CHILD]
+│           │
+│           └── return_statement                 [NODE]
+│               └── tuple                        [NODE]
+│                   ├── {"error": "User not found"}   [CHILD]
+│                   └── 404                      [CHILD]
+│
+├── decorated_definition                         [NODE]
+│   │
+│   ├── decorator                                [NODE]
+│   │   └── @app.route("/ping")                  [CHILD]
+│   │
+│   └── function_definition                      [NODE]
+│       ├── name: ping                           [CHILD]
+│       │
+│       └── body                                 [NODE]
+│           │
+│           ├── assignment                       [NODE]
+│           │   ├── name: host                   [CHILD]
+│           │   └── call                         [NODE]
+│           │       └── request.args.get("host", "")   [CHILD]
+│           │
+│           ├── assignment                       [NODE]
+│           │   ├── name: result                 [CHILD]
+│           │   └── call                         [NODE]
+│           │       └── ping_host(host)          [CHILD]
+│           │
+│           └── return_statement                 [NODE]
+│               └── dictionary                   [NODE]
+│                   ├── host → host              [CHILD]
+│                   └── result → result          [CHILD]
+│
+├── decorated_definition                         [NODE]
+│   │
+│   ├── decorator                                [NODE]
+│   │   └── @app.route("/hello")                 [CHILD]
+│   │
+│   └── function_definition                      [NODE]
+│       ├── name: hello                          [CHILD]
+│       │
+│       └── body                                 [NODE]
+│           │
+│           ├── assignment                       [NODE]
+│           │   ├── name: name                   [CHILD]
+│           │   └── call                         [NODE]
+│           │       └── request.args.get("name", "Guest")   [CHILD]
+│           │
+│           └── return_statement                 [NODE]
+│               └── call                         [NODE]
+│                   ├── function: render_template_string   [CHILD]
+│                   └── argument                 [NODE]
+│                       └── binary_operator      [NODE]
+│                           ├── "<h1>Hello "     [CHILD]
+│                           ├── +                [CHILD]
+│                           ├── name             [CHILD]
+│                           ├── +                [CHILD]
+│                           └── "</h1>"          [CHILD]
+│
+└── if_statement                                 [NODE]
+    ├── condition                                [NODE]
+    │   └── __name__ == "__main__"               [CHILD]
+    │
+    └── consequence                              [NODE]
+        └── call                                 [NODE]
+            ├── app.run                          [CHILD]
+            └── debug=True                       [CHILD]
 ```
-
-### PHASE 1 - INDEX (Build Index button -> ingestion/)
-
-This phase converts raw source files into searchable vectors.
-It runs once, and re-runs incrementally when files change.
-
-```text
-Step 1. User picks a repository folder
-   |
-   v
-Step 2. app.py passes repo_dir to index_repository(repo_dir)
-   |
-   v
-Step 3. Load the manifest (cache of last index)
-   |
-   v
-Step 4. Discover all source files in the folder
-   |
-   v
-Step 5. For each file, detect its language
-   |
-   v
-Step 6. Hash the file content
-   |
-   v
-Step 7. Compare hash with manifest
-   |
-   +-----> UNCHANGED -> reuse old code units -> skip to next file
-   |
-   +-----> CHANGED or NEW -> continue to Step 8
-   |
-   v
-Step 8. SemanticChunker splits the file
-   |
-   v
-Step 9. Tree-sitter parses each chunk
-   |
-   v
-Step 10. Build CodeUnits (functions, methods, classes)
-   |
-   v
-Step 11. Embed each CodeUnit into a vector
-   |
-   v
-Step 12. Store vectors in ChromaDB
-   |
-   v
-Step 13. Update the manifest with the new hash
-   |
-   v
-Step 14. Move to next file (repeat Step 5 to Step 13)
-   |
-   v
-Step 15. Remove deleted files from ChromaDB
-   |
-   v
-Step 16. Save manifest to disk
-   |
-   v
-Step 17. Return IndexStats to app.py
-        (files, lines, languages, units, embeddings, records)
-```
-
-Why the manifest matters: unchanged files are never re-parsed,
-re-embedded, or re-stored. That is what keeps re-indexing fast.
-
-### PHASE 2 - ANALYZE (Analyze Security button -> analysis/ + llm/)
-
-This phase runs once per rule, using only the index built in Phase 1.
-
-```text
-Step 1. Load security_rules.json (1, 5, 50 or 100 rules - same code path)
-   |
-   v
-Step 2. Pick one rule
-   |
-   v
-Step 3. Embed the rule requirement into the same vector space as the code
-   |
-   v
-Step 4. Retrieve Top-K relevant CodeUnits from ChromaDB
-        (default K = 8, semantic candidate generation only)
-   |
-   v
-Step 5. Send rule + retrieved code to the LLM (OpenRouter, strict JSON)
-   |
-   v
-Step 6. LLM returns one verdict per rule:
-        VULNERABLE or SAFE or INCONCLUSIVE, with confidence,
-        reason, and cited evidence (file, line, function, code)
-   |
-   v
-Step 7. Evidence validator checks every cited item on disk:
-        - does the file exist in the repository?
-        - is the line number real?
-        - does the quoted code actually appear near that line?
-        - does the named function exist?
-        Unverified items are dropped.
-   |
-   v
-Step 8. If verdict is VULNERABLE but no evidence survived,
-        downgrade verdict to INCONCLUSIVE
-   |
-   v
-Step 9. Deduplicate repeated evidence
-   |
-   v
-Step 10. Repeat Step 2 to Step 9 for the next rule
-   |
-   v
-Step 11. Build the final report
-
-```
-
-Key idea: vector search only proposes candidates, the LLM judges them,
-and the validator confirms the cited code really exists before it is shown.
-
-Responsibilities are strictly separated:
-
-| Component | Question it answers |
-|---|---|
-| Tree-sitter | What are the meaningful pieces of code? |
-| Vector search | Which pieces appear relevant to this security requirement? |
-| LLM | Does the retrieved code actually violate the requirement? |
-| Evidence validator | Did the LLM's evidence actually exist in the repository? |
-| `json_io` | Is the supplied JSON readable, and if not, what exactly is wrong? |
-
-## Why not send the whole repository to the LLM?
-
-A 100K-line repository does not fit (economically or technically) into a
-prompt, and most of it is irrelevant to any given rule. Instead the
-repository is parsed and embedded **once**; each rule retrieves only the
-Top-K relevant semantic units (default 8), so LLM input scales with the
-retrieved context, not with repository size.
-
-## Why Tree-sitter?
-
-Tree-sitter provides fast, incremental, grammar-based parsing for many
-languages. Instead of splitting code into arbitrary fixed-size line chunks,
-the indexer extracts real syntactic constructs (`function_definition`,
-`method_declaration`, `class_declaration`, ...). Each language has a small
-adapter entry; adding a language never changes the analysis pipeline.
-
-## Why embeddings + vector search?
-
-Security requirements are natural language ("user-controlled input must not
-be concatenated into SQL queries"). Embeddings map both requirements and
-code into the same vector space, so semantically relevant code is found
-without hard-coded, per-rule keyword logic. Vector search is **candidate
-generation, not proof** — the LLM makes the security judgment.
-
-## Security rule format
-
-Rules are structured JSON **input data**. Nothing is keyed on rule IDs, and
-1, 5, 20, 50 or 100 rules work with zero code changes:
-
-```json
-[
-  {
-    "rule_id": "SQL-001",
-    "severity": "HIGH",
-    "category": "SQL Injection",
-    "requirement": "User-controlled input must not be concatenated directly into SQL queries."
-  }
-]
-```
-
-Accepted input shapes (all collapse to the same list of rules):
-
-- one JSON array of rule objects (the normal case);
-- a single rule object, without the surrounding array;
-- several concatenated arrays, or one object per line (JSONL);
-- code fences and leading/trailing prose are ignored.
-
-Parsing is deliberately tolerant (`json_io.py` extracts JSON values instead of
-demanding exactly one), so a stray second value can no longer fail with
-`Extra data: line N column M (char K)`.
-
-## Supported languages
-
-Python, Java, JavaScript, TypeScript/TSX, C, C++, Go — via Tree-sitter
-grammars. To add a language: add its extension to
-`ingestion/language_detector.py` and an adapter to
-`ingestion/tree_sitter_parser.py` (`LANGUAGE_SPECS`).
-
-## Installation
-
-```bash
-pip install -r requirements.txt
-cp .env.example .env   # then fill in your key
-```
-
-## Configuration (environment variables)
-
-| Variable | Purpose |
-|---|---|
-| `OPENROUTER_API_KEY` | OpenRouter API key (required for analysis) |
-| `OPENROUTER_MODEL` | e.g. `openai/gpt-4o-mini` — any OpenRouter model |
-| `EMBEDDING_MODEL` | local sentence-transformers model, e.g. `all-MiniLM-L6-v2` (downloaded once, then offline) |
-| `TOP_K` | retrieved units per rule (default 8) |
-| `CHROMA_DIR` / `COLLECTION_NAME` | vector DB location |
-
-## Running
-
-```bash
-streamlit run app.py                    # UI
-python -m pytest tests -q               # offline test suite (mocked LLM)
-python scripts/live_test.py             # live OpenRouter benchmark run
-```
-
-The UI flow: upload/select a repository and a `security_rules.json` →
-**Build Index** (files, lines, languages, code units, embeddings, vector
-records) → **Analyze Security** (per-rule retrieved units with similarity
-scores, status, confidence, reason, validated evidence, and token/runtime
-metrics).
-
