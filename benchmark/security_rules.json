@@ -1,0 +1,20 @@
+[
+  {
+    "rule_id": "SQL-001",
+    "severity": "HIGH",
+    "category": "SQL Injection",
+    "requirement": "User-controlled input must not be concatenated directly into SQL queries."
+  },
+  {
+    "rule_id": "PATH-001",
+    "severity": "HIGH",
+    "category": "Path Traversal",
+    "requirement": "User-controlled file paths must not access files outside the permitted directory."
+  },
+  {
+    "rule_id": "CMD-001",
+    "severity": "CRITICAL",
+    "category": "Command Injection",
+    "requirement": "User-controlled input must not be passed directly into operating-system command execution."
+  }
+]

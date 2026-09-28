@@ -1,0 +1,23 @@
+# Parsing
+tree-sitter>=0.24
+tree-sitter-python
+tree-sitter-javascript
+tree-sitter-java
+tree-sitter-typescript
+tree-sitter-c
+tree-sitter-cpp
+tree-sitter-go
+
+# Vector database (local, no cloud)
+chromadb>=1.0
+
+# Embeddings (local model; no paid API required)
+sentence-transformers>=3.0
+
+# LLM access
+requests>=2.31
+
+# Config / UI / tests
+python-dotenv>=1.0
+streamlit>=1.30
+pytest>=8.0

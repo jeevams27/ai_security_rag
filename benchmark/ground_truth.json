@@ -1,0 +1,15 @@
+{
+  "description": "Ground truth for the small benchmark (~100 lines, 3 languages).",
+  "vulnerabilities": [
+    {"rule_id": "SQL-001", "file": "vulnerable.py", "function": "find_user_vulnerable", "expected": "VULNERABLE"},
+    {"rule_id": "SQL-001", "file": "vulnerable.py", "function": "find_user_safe", "expected": "SAFE"},
+    {"rule_id": "SQL-001", "file": "Vulnerable.java", "function": "findUserVulnerable", "expected": "VULNERABLE"},
+    {"rule_id": "SQL-001", "file": "Vulnerable.java", "function": "findUserSafe", "expected": "SAFE"},
+    {"rule_id": "SQL-001", "file": "vulnerable.js", "function": "searchProductsVulnerable", "expected": "VULNERABLE"},
+    {"rule_id": "SQL-001", "file": "vulnerable.js", "function": "searchProductsSafe", "expected": "SAFE"},
+    {"rule_id": "PATH-001", "file": "vulnerable.py", "function": "read_upload_vulnerable", "expected": "VULNERABLE"},
+    {"rule_id": "PATH-001", "file": "vulnerable.py", "function": "read_upload_safe", "expected": "SAFE"},
+    {"rule_id": "CMD-001", "file": "vulnerable.js", "function": "pingHostVulnerable", "expected": "VULNERABLE"},
+    {"rule_id": "CMD-001", "file": "vulnerable.js", "function": "pingHostSafe", "expected": "SAFE"}
+  ]
+}

@@ -1,0 +1,35 @@
+# Secrets & credentials (NEVER commit your real API keys!)
+.env
+*.env
+!.env.example
+
+# Vector store cache & sqlite DB (local index data)
+.chroma/
+*.sqlite3
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Test & coverage caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+env/
+
+# IDE / Editor folders
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
