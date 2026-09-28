@@ -241,34 +241,3 @@ records) → **Analyze Security** (per-rule retrieved units with similarity
 scores, status, confidence, reason, validated evidence, and token/runtime
 metrics).
 
-## Benchmark
-
-`benchmark/source/` contains ~107 lines across Python, Java and JavaScript
-with intentional SQL-injection, path-traversal and command-injection
-vulnerabilities plus safe counterparts, and `benchmark/ground_truth.json`
-records the expected verdict per rule per function.
-
-## Current limitations
-
-- Vector search does not guarantee vulnerability detection; missed
-  retrieval means missed analysis (recall is bounded by Top-K).
-- Retrieval is purely semantic (dense) — no keyword/symbol/call-graph
-  augmentation yet.
-- No cross-unit context expansion (e.g. caller → callee) yet; the
-  architecture leaves room for it.
-- The embedding model is a local sentence-transformers model: the first run
-  downloads it once from Hugging Face, after which everything runs offline.
-- Evidence validation checks file/line/code existence, not whether the
-  evidence semantically supports the verdict.
-
-## 100K-line scalability strategy
-
-1. Index once: parse → semantic units → embed → store (cached by file
-   content hash; unchanged files are never re-embedded).
-2. Per rule: embed rule → Top-K retrieval → LLM on retrieved units only.
-   LLM input size is independent of total repository size.
-3. Batch embedding, persistent ChromaDB, and the hash manifest keep
-   re-indexing incremental.
-4. Before 100K-line testing: benchmark retrieval recall at 500/1K/10K/50K
-   lines, add hybrid (keyword + dense) retrieval if recall drops, consider
-   batching/async LLM calls and a cross-encoder reranker.
