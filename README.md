@@ -136,11 +136,7 @@ Step 10. Repeat Step 2 to Step 9 for the next rule
    |
    v
 Step 11. Build the final report
-        - screen shows VULNERABLE findings only, fully open:
-          why it is vulnerable + file/line/function/code table
-          + what NOT to do + what to do instead
-        - JSON download keeps everything (all verdicts, retrieved units,
-          evidence, token usage, runtime)
+
 ```
 
 Key idea: vector search only proposes candidates, the LLM judges them,
